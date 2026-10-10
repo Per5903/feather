@@ -10,6 +10,7 @@ use feather_protocol::{ClientOp, Snowflake};
 
 #[tokio::main]
 async fn main() {
+    feather_core::tls::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [server, token, action, channel, rest @ ..] = args.as_slice() else {
         eprintln!("использование: bot <сервер> <токен> typing|say <канал> <секунд|текст>");

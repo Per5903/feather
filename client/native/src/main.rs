@@ -15,6 +15,7 @@ use slint::{ComponentHandle, Timer, TimerMode};
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
+    feather_core::tls::init();
     // WebRTC при подключении проверяет видеодекодер NVIDIA и поднимает контекст CUDA:
     // +80 МБ памяти ради видео, которого в голосе нет (bench/README.md, замер 11).
     // Аппаратное КОДИРОВАНИЕ для демонстрации экрана это не отключает.

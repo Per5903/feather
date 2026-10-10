@@ -8,4 +8,6 @@ publish = false
 livekit = { version = "0.9", features = ["rustls-tls-native-roots"] }
 livekit-api = { version = "0.8", default-features = false, features = ["access-token"] }
 tokio = { version = "1", features = ["full"] }
+# Явный криптобэкенд TLS для wss:// (см. client/core/src/tls.rs)
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 futures-util = "0.3"

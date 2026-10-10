@@ -2355,6 +2355,7 @@ dependencies = [
  "rfd",
  "ringbuf",
  "rmp-serde",
+ "rustls",
  "serde",
  "serde_json",
  "tauri-winrt-notification",
@@ -2446,6 +2447,7 @@ dependencies = [
  "futures-util",
  "livekit",
  "livekit-api",
+ "rustls",
  "tokio",
 ]
 
