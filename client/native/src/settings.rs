@@ -15,6 +15,8 @@ pub struct Settings {
     pub echo_cancellation: bool,
     /// Программная отрисовка: 55 МБ вместо 118 МБ (bench/README.md, замер 11)
     pub economy_mode: bool,
+    /// Уведомления о личных сообщениях и упоминаниях
+    pub notifications: bool,
 }
 
 impl Default for Settings {
@@ -26,6 +28,7 @@ impl Default for Settings {
             noise_suppression: true,
             echo_cancellation: true,
             economy_mode: false,
+            notifications: true,
         }
     }
 }

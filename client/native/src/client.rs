@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, VoiceEvent, VoiceOptions, VoiceSession};
+use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, Notifier, VoiceEvent, VoiceOptions, VoiceSession};
 use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, Message, Snowflake, User, VoiceState};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
@@ -200,8 +200,17 @@ fn msg_row(prev: Option<&Message>, m: &Message, me: Snowflake, moderator: bool) 
         edited: m.edited_at.is_some(),
         own: m.author.id == me,
         can_delete: m.author.id == me || moderator,
+        mention: false,
         ..Default::default()
     }
+}
+
+/// Упомянут ли пользователь в тексте: «@имя» без учёта регистра, целым словом
+fn mentions(text: &str, username: &str) -> bool {
+    let (text, needle) = (text.to_lowercase(), format!("@{}", username.to_lowercase()));
+    text.match_indices(&needle).any(|(i, _)| {
+        text[i + needle.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-'))
+    })
 }
 
 /// «Шторм печатает…», «Шторм и Лиса печатают…», «Несколько человек печатают…»
@@ -284,6 +293,7 @@ struct App {
     /// Кто в голосовых каналах (по данным сервера): пользователь → состояние
     voice_states: HashMap<Snowflake, VoiceState>,
     settings: Settings,
+    notifier: Option<Notifier>,
     /// Глобальная клавиша push-to-talk (пока включён режим PTT)
     hotkey: Option<HotkeyHandle>,
     ptt_pressed: bool,
@@ -342,6 +352,7 @@ impl App {
             voice_seq: 0,
             voice_states: HashMap::new(),
             settings: settings::load(),
+            notifier: None,
             hotkey: None,
             ptt_pressed: false,
             editing: None,
@@ -355,6 +366,10 @@ impl App {
         APP.with_borrow_mut(|slot| *slot = Some(app));
         APP.with_borrow_mut(|slot| {
             if let Some(app) = slot.as_mut() {
+                app.notifier = {
+                    let _guard = app.rt.enter();
+                    Some(Notifier::spawn(APP_ID))
+                };
                 app.update_hotkey();
                 // Для снимков интерфейса в автотестах
                 if std::env::var_os("FEATHER_OPEN_SETTINGS").is_some() {
@@ -579,7 +594,30 @@ impl App {
     }
 
     fn row_at(&self, i: usize) -> Msg {
-        msg_row(i.checked_sub(1).map(|p| &self.messages[p]), &self.messages[i], self.me.id, self.moderator())
+        let m = &self.messages[i];
+        Msg {
+            mention: m.author.id != self.me.id && mentions(&m.content, &self.me.username),
+            ..msg_row(i.checked_sub(1).map(|p| &self.messages[p]), m, self.me.id, self.moderator())
+        }
+    }
+
+    /// Уведомление о сообщении в неоткрытом канале: личное или упоминание
+    fn maybe_notify(&self, m: &Message, dm: bool) {
+        if !self.settings.notifications || m.author.id == self.me.id || Some(m.channel_id) == self.channel {
+            return;
+        }
+        let author = m.author.display_name.as_deref().unwrap_or(&m.author.username);
+        let title = if dm {
+            author.to_owned()
+        } else if mentions(&m.content, &self.me.username) {
+            let channel = self.channels.iter().find(|c| c.id == m.channel_id).map(|c| c.name.as_str()).unwrap_or("канал");
+            format!("{author} в #{channel}")
+        } else {
+            return;
+        };
+        if let Some(n) = &self.notifier {
+            n.show(&m.channel_id.to_string(), &title, &m.content);
+        }
     }
 
     fn rebuild_messages(&self) {
@@ -943,6 +981,22 @@ impl App {
                     self.unread.remove(&c);
                 }
                 self.set_status("");
+                // Список личных диалогов нужен и в режиме сервера: метки и уведомления о личке
+                {
+                    let api = self.api.clone();
+                    self.rt.spawn(async move {
+                        if let Ok(dms) = api.dms().await {
+                            post(move |app| {
+                                for d in dms {
+                                    if !app.dms.iter().any(|x| x.id == d.id) {
+                                        app.dms.push(d);
+                                    }
+                                }
+                                app.sort_dms();
+                            });
+                        }
+                    });
+                }
                 if self.dm_mode {
                     // Переподключение в личных сообщениях: догружаем открытый диалог
                     self.refresh_guilds();
@@ -1002,7 +1056,17 @@ impl App {
                 if Some(m.channel_id) == self.channel {
                     self.add_message(m);
                     self.ack_latest();
-                } else if let Some(d) = self.dms.iter_mut().find(|d| d.id == m.channel_id) {
+                } else if !self.dms.iter().any(|d| d.id == m.channel_id)
+                    && !self.channels.iter().any(|c| c.id == m.channel_id)
+                    && m.author.id != self.me.id
+                {
+                    // Канал неизвестен: по серверам без подписки приходит UNREAD_UPDATE, а не само
+                    // сообщение, значит это личка (список диалогов ещё не загружен) — добавляем её
+                    self.dms.push(DmChannel { id: m.channel_id, recipients: vec![m.author.clone()], last_message_id: Some(m.id) });
+                    self.on_event(Event::MessageCreate(m));
+                } else if self.dms.iter().any(|d| d.id == m.channel_id) {
+                    self.maybe_notify(&m, true);
+                    let d = self.dms.iter_mut().find(|d| d.id == m.channel_id).expect("проверено выше");
                     // Личное сообщение в неоткрытом диалоге: метка на «Личных сообщениях», диалог наверх
                     d.last_message_id = Some(m.id);
                     if m.author.id != self.me.id {
@@ -1012,6 +1076,7 @@ impl App {
                     self.refresh_guilds();
                     self.refresh_channels();
                 } else if m.author.id != self.me.id && self.channels.iter().any(|c| c.id == m.channel_id) {
+                    self.maybe_notify(&m, false);
                     if let Some(g) = self.guild {
                         self.unread.insert(m.channel_id, Some(g));
                     }
@@ -1252,6 +1317,7 @@ impl App {
         ui.set_set_noise(self.settings.noise_suppression);
         ui.set_set_echo(self.settings.echo_cancellation);
         ui.set_set_economy(self.settings.economy_mode);
+        ui.set_set_notify(self.settings.notifications);
         self.device_lists = (inputs, outputs);
         ui.set_dialog("settings".into());
     }
@@ -1267,6 +1333,7 @@ impl App {
             noise_suppression: ui.get_set_noise(),
             echo_cancellation: ui.get_set_echo(),
             economy_mode: ui.get_set_economy(),
+            notifications: ui.get_set_notify(),
         };
         settings::save(&self.settings);
         ui.set_dialog(SharedString::new());
@@ -1374,5 +1441,19 @@ impl App {
         }
         // Состояние удаляем после выхода из текущего заимствования APP
         let _ = slint::invoke_from_event_loop(|| APP.with_borrow_mut(|a| *a = None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentions;
+
+    #[test]
+    fn mention_detection() {
+        assert!(mentions("@Kerrigan го в рейд", "kerrigan"));
+        assert!(mentions("эй, @kerrigan!", "Kerrigan"));
+        assert!(!mentions("@kerrigan2 не ты", "kerrigan"), "только целое имя");
+        assert!(!mentions("kerrigan без собаки", "kerrigan"));
+        assert!(mentions("привет @Шторм", "шторм"));
     }
 }

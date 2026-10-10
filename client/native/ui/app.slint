@@ -14,6 +14,8 @@ export struct Msg {
     /// Своё сообщение (можно редактировать) / можно удалить (своё или я владелец сервера)
     own: bool,
     can-delete: bool,
+    /// Меня упомянули (@имя): строка подсвечивается
+    mention: bool,
     has-image: bool,
     img-w: length,
     img-h: length,
@@ -119,7 +121,12 @@ component MessageRow inherits TouchArea {
     in property <Msg> m;
     callback edit();
     callback delete();
-    Rectangle { background: root.has-hover ? Theme.row-hover : transparent; }
+    Rectangle { background: m.mention ? #f0b23214 : root.has-hover ? Theme.row-hover : transparent; }
+    if m.mention: Rectangle {
+        x: 0;
+        width: 2px;
+        background: #f0b232;
+    }
     HorizontalLayout {
         padding-left: 16px;
         padding-right: 16px;
@@ -485,6 +492,7 @@ component SettingsDialog inherits Rectangle {
     in-out property <bool> noise;
     in-out property <bool> echo;
     in-out property <bool> economy;
+    in-out property <bool> notify;
     in property <string> ptt-key;
     callback save();
     callback cancel();
@@ -523,6 +531,11 @@ component SettingsDialog inherits Rectangle {
             if ptt: HorizontalLayout {
                 alignment: start;
                 Button { text: "Назначить клавишу…"; clicked => { root.configure-ptt(); } }
+            }
+            SettingRow {
+                title: "Уведомления";
+                hint: "Личные сообщения и упоминания @вас, когда канал не открыт";
+                checked <=> root.notify;
             }
             SettingRow {
                 title: "Шумоподавление";
@@ -615,6 +628,7 @@ export component AppWindow inherits Window {
     in-out property <bool> set-noise;
     in-out property <bool> set-echo;
     in-out property <bool> set-economy;
+    in-out property <bool> set-notify;
     in property <string> ptt-key;
     callback open-settings();
     callback save-settings();
@@ -1111,6 +1125,7 @@ export component AppWindow inherits Window {
         noise <=> root.set-noise;
         echo <=> root.set-echo;
         economy <=> root.set-economy;
+        notify <=> root.set-notify;
         ptt-key: root.ptt-key;
         save => { root.save-settings(); }
         cancel => { root.dialog = ""; }

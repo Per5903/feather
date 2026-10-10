@@ -57,6 +57,7 @@ impl Feed {
             edited: false,
             own: false,
             can_delete: false,
+            mention: false,
             has_image: m.image.is_some(),
             img_w,
             img_h,
