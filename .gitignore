@@ -16,3 +16,4 @@ bench/audio/street_*
 deploy/selfhost/.env
 server/data/
 data/
+deploy/dev-accounts.md
