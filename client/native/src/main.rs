@@ -53,10 +53,10 @@ fn bench_modes(ui: &AppWindow) -> Vec<Timer> {
         let dir = std::cell::Cell::new(1.0f32);
         let t = Timer::default();
         t.start(TimerMode::Repeated, Duration::from_millis(16), move || {
-            if let Some(ui) = weak.upgrade() {
-                if ui.invoke_scroll_by(40.0 * dir.get()) {
-                    dir.set(-dir.get());
-                }
+            if let Some(ui) = weak.upgrade()
+                && ui.invoke_scroll_by(40.0 * dir.get())
+            {
+                dir.set(-dir.get());
             }
         });
         timers.push(t);

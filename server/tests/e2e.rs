@@ -293,3 +293,51 @@ async fn gateway_rejects_bad_token() {
     assert!(matches!(closed, None | Some(Ok(Ws::Close(_))) | Some(Err(_))));
     srv.drop_db().await;
 }
+
+#[tokio::test]
+async fn read_states() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "R".into() }).await;
+    let g = g.unwrap();
+    let text = g.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{}/invites", g.guild.id), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", inv.unwrap().code), Some(&bob.token), &()).await;
+
+    let mut last = None;
+    for t in ["раз", "два"] {
+        let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &SendMessageRequest { content: t.into(), reply_to_id: None, nonce: None }).await;
+        last = m.map(|m| m.id);
+    }
+    let last = last.unwrap();
+    let unread_of = |op: ServerOp| match op {
+        ServerOp::Ready { unread, .. } => unread,
+        other => panic!("ожидался READY, пришло {other:?}"),
+    };
+
+    // У автора своих сообщений непрочитанного нет, у Bob — есть
+    let (_, ready) = GatewayClient::connect(srv.addr, &alice.token).await;
+    assert!(unread_of(ready).is_empty(), "свои сообщения не непрочитанные");
+    let (mut bob_gw, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
+    assert_eq!(unread_of(ready), vec![UnreadChannel { guild_id: g.guild.id, channel_id: text, last_message_id: last }]);
+
+    // Bob дочитал: его же шлюз (другие устройства) получает CHANNEL_ACK
+    let (st, _) = srv.post::<_, ()>(&format!("/channels/{text}/ack"), Some(&bob.token), &AckRequest { message_id: last }).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(bob_gw.next_event().await, Event::ChannelAck { channel_id: text, message_id: last });
+
+    // Отметка не откатывается назад, а после переподключения непрочитанного нет
+    let first = Snowflake(last.0 - 1);
+    srv.post::<_, ()>(&format!("/channels/{text}/ack"), Some(&bob.token), &AckRequest { message_id: first }).await;
+    let (_, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
+    assert!(unread_of(ready).is_empty());
+
+    // Чужой канал отметить нельзя
+    let carol = srv.signup("carol").await;
+    let (st, _) = srv.post::<_, ApiError>(&format!("/channels/{text}/ack"), Some(&carol.token), &AckRequest { message_id: last }).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    drop(bob_gw);
+    srv.drop_db().await;
+}

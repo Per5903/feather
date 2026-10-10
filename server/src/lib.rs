@@ -51,6 +51,7 @@ fn router(state: Shared) -> Router {
         .route("/invites/{code}", post(guilds::accept_invite))
         .route("/channels/{id}/messages", get(messages::history).post(messages::send))
         .route("/channels/{id}/messages/{mid}", patch(messages::edit).delete(messages::delete))
+        .route("/channels/{id}/ack", post(messages::ack))
         .route("/channels/{id}/voice/join", post(voice::join));
     Router::new()
         .nest("/api/v1", api)

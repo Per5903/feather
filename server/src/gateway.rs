@@ -19,6 +19,7 @@ use crate::Shared;
 use crate::auth::user_by_token;
 use crate::bus::{Envelope, Target};
 use crate::guilds::user_guilds;
+use crate::messages::unread_channels;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -107,6 +108,7 @@ impl Session {
             return Err("неверный токен".into());
         };
         let guilds = user_guilds(&st.db, user.id).await.map_err(|e| format!("{e:?}"))?;
+        let unread = unread_channels(&st.db, user.id).await.map_err(|e| format!("{e:?}"))?;
         let mut member_of: HashSet<Snowflake> = guilds.iter().map(|g| g.id).collect();
         let mut subscribed: HashSet<Snowflake> = HashSet::new();
         let mut background = false;
@@ -115,7 +117,7 @@ impl Session {
         let mut session_id = [0u8; 12];
         getrandom::fill(&mut session_id).map_err(|e| e.to_string())?;
         let session_id = session_id.iter().map(|b| format!("{b:02x}")).collect();
-        s.send(&ServerOp::Ready { session_id, user, guilds }).await?;
+        s.send(&ServerOp::Ready { session_id, user, guilds, unread }).await?;
         tracing::debug!("шлюз: пользователь {me} подключён");
 
         // Клиент шлёт HEARTBEAT раз в интервал; два пропуска подряд — соединение мёртвое

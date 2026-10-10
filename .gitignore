@@ -13,3 +13,4 @@ client/desktop/gen/
 bench/audio/src/
 bench/audio/*.wav
 bench/audio/street_*
+deploy/selfhost/.env

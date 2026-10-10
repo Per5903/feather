@@ -5,7 +5,7 @@
 //! возвращают результаты через `post`, который выполняет замыкание в потоке интерфейса.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -184,11 +184,11 @@ struct App {
     gw: Option<GatewayHandle>,
     me: User,
     guilds: Vec<Guild>,
-    unread_guilds: HashSet<Snowflake>,
     guild: Option<Snowflake>,
     /// В порядке отображения
     channels: Vec<Channel>,
-    unread_channels: HashSet<Snowflake>,
+    /// Непрочитанные каналы → их сервер (метка сервера = есть хоть один его канал)
+    unread: HashMap<Snowflake, Snowflake>,
     channel: Option<Snowflake>,
     members: Vec<User>,
     /// Сообщения открытого канала, от старых к новым
@@ -222,10 +222,9 @@ impl App {
             gw: Some(gw),
             me,
             guilds: Vec::new(),
-            unread_guilds: HashSet::new(),
             guild: None,
             channels: Vec::new(),
-            unread_channels: HashSet::new(),
+            unread: HashMap::new(),
             channel: None,
             members: Vec::new(),
             messages: Vec::new(),
@@ -263,7 +262,7 @@ impl App {
                 // Инициалы как в Discord: первые буквы слов, максимум 3
                 initial: g.name.split_whitespace().filter_map(|w| w.chars().next()).take(3).collect::<String>().into(),
                 active: Some(g.id) == self.guild,
-                unread: self.unread_guilds.contains(&g.id),
+                unread: Some(g.id) != self.guild && self.unread.values().any(|gid| *gid == g.id),
             })
             .collect();
         ui.set_guilds(ModelRc::new(VecModel::from(items)));
@@ -284,7 +283,7 @@ impl App {
                     Kind::Category => ChannelKind::Category,
                 },
                 active: Some(c.id) == self.channel,
-                unread: self.unread_channels.contains(&c.id),
+                unread: self.unread.contains_key(&c.id),
             })
             .collect();
         ui.set_channels(ModelRc::new(VecModel::from(items)));
@@ -326,7 +325,6 @@ impl App {
             self.gw_send(ClientOp::UnsubscribeGuild { guild_id: prev });
         }
         self.guild = Some(id);
-        self.unread_guilds.remove(&id);
         self.gw_send(ClientOp::SubscribeGuild { guild_id: id });
         self.channel = None;
         self.channels.clear();
@@ -373,8 +371,9 @@ impl App {
         }
         self.set_status("");
         self.channel = Some(c.id);
-        self.unread_channels.remove(&c.id);
+        self.unread.remove(&c.id);
         self.refresh_channels();
+        self.refresh_guilds();
         self.messages.clear();
         self.model.set_vec(Vec::new());
 
@@ -398,6 +397,7 @@ impl App {
                         app.messages = history;
                         app.rebuild_messages();
                         app.scroll_to_bottom_later();
+                        app.ack_latest();
                     }
                     Err(e) => app.set_status(format!("Не удалось загрузить историю: {e}")),
                 }
@@ -427,6 +427,18 @@ impl App {
         }
     }
 
+    /// Отметить открытый канал прочитанным до последнего сообщения
+    fn ack_latest(&self) {
+        let (Some(channel), Some(last)) = (self.channel, self.messages.last()) else { return };
+        if last.author.id == self.me.id {
+            return; // свои сообщения сервер отмечает прочитанными сам
+        }
+        let (api, id) = (self.api.clone(), last.id);
+        self.rt.spawn(async move {
+            let _ = api.ack(channel, id).await;
+        });
+    }
+
     fn send(&mut self, text: String) {
         let Some(channel) = self.channel else { return };
         if text.is_empty() {
@@ -449,9 +461,13 @@ impl App {
 
     fn on_gateway(&mut self, ev: GatewayEvent) {
         match ev {
-            GatewayEvent::Ready { user, guilds } => {
+            GatewayEvent::Ready { user, guilds, unread } => {
                 self.me = user;
                 self.guilds = guilds;
+                self.unread = unread.into_iter().map(|u| (u.channel_id, u.guild_id)).collect();
+                if let Some(c) = self.channel {
+                    self.unread.remove(&c);
+                }
                 self.set_status("");
                 match self.guild.filter(|g| self.guilds.iter().any(|x| x.id == *g)) {
                     // Переподключение: подписка на сервере сбросилась, возобновляем и догружаем пропущенное
@@ -487,8 +503,11 @@ impl App {
             Event::MessageCreate(m) => {
                 if Some(m.channel_id) == self.channel {
                     self.add_message(m);
+                    self.ack_latest();
                 } else if m.author.id != self.me.id && self.channels.iter().any(|c| c.id == m.channel_id) {
-                    self.unread_channels.insert(m.channel_id);
+                    if let Some(g) = self.guild {
+                        self.unread.insert(m.channel_id, g);
+                    }
                     self.refresh_channels();
                 }
             }
@@ -530,10 +549,17 @@ impl App {
                     self.refresh_guilds();
                 }
             }
-            Event::UnreadUpdate { guild_id, author_id, .. } => {
-                if Some(guild_id) != self.guild && author_id != self.me.id {
-                    self.unread_guilds.insert(guild_id);
+            Event::UnreadUpdate { guild_id, channel_id, author_id, .. } => {
+                if author_id != self.me.id {
+                    self.unread.insert(channel_id, guild_id);
                     self.refresh_guilds();
+                }
+            }
+            Event::ChannelAck { channel_id, .. } => {
+                // Дочитано на другом устройстве
+                if self.unread.remove(&channel_id).is_some() {
+                    self.refresh_guilds();
+                    self.refresh_channels();
                 }
             }
         }

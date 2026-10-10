@@ -144,6 +144,11 @@ impl Api {
         self.call::<(), _>(Method::GET, &path, None).await
     }
 
+    /// «Дочитал канал до этого сообщения»
+    pub async fn ack(&self, channel: Snowflake, message: Snowflake) -> Result<()> {
+        self.call(Method::POST, &format!("/channels/{channel}/ack"), Some(&AckRequest { message_id: message })).await
+    }
+
     pub async fn send_message(&self, channel: Snowflake, content: &str, nonce: String) -> Result<Message> {
         let req = SendMessageRequest { content: content.into(), reply_to_id: None, nonce: Some(nonce) };
         self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(&req)).await

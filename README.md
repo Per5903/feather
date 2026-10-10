@@ -29,6 +29,7 @@
 | [08-roadmap.md](docs/08-roadmap.md) | Этапы и задачи |
 | [09-decisions.md](docs/09-decisions.md) | Принятые решения и открытые вопросы |
 | [10-test-infra.md](docs/10-test-infra.md) | Какие серверы нужны для тестов |
+| [11-selfhost.md](docs/11-selfhost.md) | **Свой сервер за 5 минут** (Docker, HTTPS) |
 
 ## Статус
 
@@ -68,4 +69,4 @@ FEATHER_DEMO=1 cargo run --release -p feather-native
 | `client/ptt-proto/` | прототип глобального push-to-talk (Wayland) |
 | `client/desktop/`, `client/ui/` | старый прототип на Tauri, только для сравнения |
 | `bench/` | замеры ресурсов и звука |
-| `deploy/` | docker-compose для разработки |
+| `deploy/` | docker-compose для разработки, `deploy/selfhost/` — для своего сервера |

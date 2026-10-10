@@ -4,7 +4,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use feather_protocol::{ChannelKind, EditMessageRequest, Event, Message, SendMessageRequest, Snowflake, User};
+use feather_protocol::{AckRequest, ChannelKind, EditMessageRequest, Event, Message, SendMessageRequest, Snowflake, UnreadChannel, User};
 use serde::Deserialize;
 use sqlx::PgPool;
 
@@ -102,6 +102,8 @@ pub async fn send(
         .bind(req.reply_to_id.map(|r| r.0 as i64))
         .execute(&st.db)
         .await?;
+    // Своё сообщение считается прочитанным: иначе канал «загорится» на других устройствах автора
+    mark_read(&st.db, user.id(), channel_id, id).await?;
     let message = Message {
         id,
         channel_id,
@@ -155,4 +157,55 @@ pub async fn delete(
     sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id.0 as i64).execute(&st.db).await?;
     st.bus.publish(Target::Guild(channel.guild_id), Event::MessageDelete { id: message_id, channel_id });
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Отметка «дочитал до message_id»; назад не откатывается (GREATEST)
+async fn mark_read(db: &PgPool, user: Snowflake, channel: Snowflake, message: Snowflake) -> ApiResult<()> {
+    sqlx::query(
+        "INSERT INTO read_states (user_id, channel_id, last_read_message_id) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, channel_id)
+         DO UPDATE SET last_read_message_id = GREATEST(read_states.last_read_message_id, EXCLUDED.last_read_message_id)",
+    )
+    .bind(user.0 as i64)
+    .bind(channel.0 as i64)
+    .bind(message.0 as i64)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn ack(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path(channel_id): Path<Snowflake>,
+    Json(req): Json<AckRequest>,
+) -> ApiResult<StatusCode> {
+    channel_for_member(&st.db, channel_id, user.id()).await?;
+    mark_read(&st.db, user.id(), channel_id, req.message_id).await?;
+    st.bus.publish(Target::User(user.id()), Event::ChannelAck { channel_id, message_id: req.message_id });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Текстовые каналы пользователя, где есть сообщения новее его отметки о прочтении
+pub async fn unread_channels(db: &PgPool, user: Snowflake) -> ApiResult<Vec<UnreadChannel>> {
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT c.guild_id, c.id, lm.last_id
+           FROM channels c
+           JOIN guild_members gm ON gm.guild_id = c.guild_id AND gm.user_id = $1
+           CROSS JOIN LATERAL (SELECT max(id) AS last_id FROM messages WHERE channel_id = c.id) lm
+           LEFT JOIN read_states rs ON rs.channel_id = c.id AND rs.user_id = $1
+          WHERE c.kind = 'text' AND lm.last_id IS NOT NULL
+            AND (rs.last_read_message_id IS NULL OR lm.last_id > rs.last_read_message_id)",
+    )
+    .bind(user.0 as i64)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(g, c, m)| UnreadChannel {
+            guild_id: Snowflake(g as u64),
+            channel_id: Snowflake(c as u64),
+            last_message_id: Snowflake(m as u64),
+        })
+        .collect())
 }

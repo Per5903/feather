@@ -181,6 +181,19 @@ pub struct EditMessageRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AckRequest {
+    pub message_id: Snowflake,
+}
+
+/// Канал, в котором есть непрочитанное (приходит в READY)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UnreadChannel {
+    pub guild_id: Snowflake,
+    pub channel_id: Snowflake,
+    pub last_message_id: Snowflake,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VoiceJoinResponse {
     /// Адрес LiveKit для клиента
     pub url: String,
@@ -214,7 +227,14 @@ pub enum ClientOp {
 #[serde(tag = "op", content = "d", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ServerOp {
     Hello { heartbeat_interval_ms: u64 },
-    Ready { session_id: String, user: User, guilds: Vec<Guild> },
+    Ready {
+        session_id: String,
+        user: User,
+        guilds: Vec<Guild>,
+        /// Каналы с непрочитанным на момент подключения
+        #[serde(default)]
+        unread: Vec<UnreadChannel>,
+    },
     HeartbeatAck,
     Dispatch { seq: u64, event: Event },
     /// Сессия недействительна (неверный токен и т.п.); соединение будет закрыто
@@ -231,6 +251,8 @@ pub enum Event {
     GuildMemberAdd { guild_id: Snowflake, user: User },
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
+    /// Пользователь дочитал канал (на этом или другом своём устройстве)
+    ChannelAck { channel_id: Snowflake, message_id: Snowflake },
     /// По неподписанным серверам приходят только счётчики
     /// `author_id` — чтобы клиент не помечал непрочитанными свои же сообщения (с другого устройства)
     UnreadUpdate { guild_id: Snowflake, channel_id: Snowflake, last_message_id: Snowflake, author_id: Snowflake },
@@ -239,7 +261,7 @@ pub enum Event {
 impl Event {
     /// Полное событие или «лёгкое» (для серверов без подписки)
     pub fn is_heavy(&self) -> bool {
-        !matches!(self, Event::GuildCreate(_) | Event::UnreadUpdate { .. })
+        !matches!(self, Event::GuildCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. })
     }
 }
 

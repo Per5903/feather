@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use feather_protocol::{ClientOp, Event, Guild, ServerOp, User};
+use feather_protocol::{ClientOp, Event, Guild, ServerOp, UnreadChannel, User};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as Ws;
@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 #[derive(Debug)]
 pub enum GatewayEvent {
     /// Подключились (или переподключились): клиенту нужно заново подписаться на открытый сервер
-    Ready { user: User, guilds: Vec<Guild> },
+    Ready { user: User, guilds: Vec<Guild>, unread: Vec<UnreadChannel> },
     Event(Event),
     /// Связь потеряна, идёт переподключение
     Reconnecting(String),
@@ -96,9 +96,9 @@ async fn session(
                         heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
                         heartbeat.tick().await;
                     }
-                    Ok(ServerOp::Ready { user, guilds, .. }) => {
+                    Ok(ServerOp::Ready { user, guilds, unread, .. }) => {
                         ready = true;
-                        on_event(GatewayEvent::Ready { user, guilds });
+                        on_event(GatewayEvent::Ready { user, guilds, unread });
                     }
                     Ok(ServerOp::Dispatch { seq: s, event }) => {
                         seq = s;

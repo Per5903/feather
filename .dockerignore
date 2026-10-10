@@ -1,0 +1,9 @@
+target/
+**/node_modules/
+**/dist/
+.git/
+bench/audio/*.wav
+bench/audio/src/
+bench/results/
+deploy/.env
+deploy/selfhost/.env
