@@ -1,0 +1,12 @@
+# Rust
+target/
+# Node
+node_modules/
+dist/
+# Локальные настройки
+.env
+*.log
+bench/results/*.json
+!bench/results/.gitkeep
+# Tauri
+client/desktop/gen/

@@ -1,0 +1,10 @@
+{
+  "name": "feather",
+  "private": true,
+  "scripts": {
+    "ui:dev": "pnpm --filter @feather/ui dev",
+    "ui:build": "pnpm --filter @feather/ui build",
+    "desktop:dev": "pnpm --filter @feather/desktop tauri dev",
+    "desktop:build": "pnpm --filter @feather/desktop tauri build"
+  }
+}

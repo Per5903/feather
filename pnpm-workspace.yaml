@@ -1,0 +1,6 @@
+packages:
+  - client/ui
+  - client/desktop
+minimumReleaseAgeExclude:
+  - '@tanstack/solid-virtual@3.13.41'
+  - '@tanstack/virtual-core@3.18.0'

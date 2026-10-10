@@ -1,0 +1,13 @@
+# Конфиг LiveKit для локальной разработки.
+# Ключи берутся из переменной окружения LIVEKIT_KEYS (см. docker-compose.yml).
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+rtc:
+  tcp_port: 7881
+  udp_port: 7882          # один UDP-порт для всех медиапотоков (удобно для файрвола)
+  use_external_ip: false  # локально; на VPS: true
+logging:
+  level: info
+room:
+  empty_timeout: 300

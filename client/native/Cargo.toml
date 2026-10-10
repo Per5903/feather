@@ -1,0 +1,22 @@
+[package]
+name = "feather-native"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Без Qt-бэкенда: только winit + два рендерера (OpenGL и программный), чтобы сравнить их
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    "accessibility",
+] }
+
+# Только для снимков окна в режиме FEATHER_SNAPSHOT (прототип)
+png = "0.18"
+
+[build-dependencies]
+slint-build = "1.18"

@@ -1,0 +1,15 @@
+[package]
+name = "feather-desktop"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+# Тонкая настройка WebKitGTK (снижение памяти), см. docs/02-performance.md
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0"

@@ -1,0 +1,155 @@
+/* Правила производительности (docs/02-performance.md):
+   - анимации только transform/opacity;
+   - без backdrop-filter, больших теней и анимированных градиентов;
+   - системный шрифт, без веб-шрифтов. */
+
+:root {
+  --bg-0: #111214;
+  --bg-1: #1a1b1e;
+  --bg-2: #222327;
+  --bg-hover: #2b2d31;
+  --bg-active: #34363c;
+  --text: #dcdee1;
+  --text-dim: #8e9297;
+  --accent: #6c8cff;
+  --border: #2a2b2f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg-0);
+  color: var(--text);
+  font: 15px/1.375 system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif;
+  overflow: hidden;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 64px 232px 1fr 220px;
+  height: 100%;
+}
+
+/* ---- Список серверов ---- */
+.servers {
+  background: var(--bg-0);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+}
+.server {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  background: var(--bg-2);
+  display: grid; place-items: center;
+  font-weight: 600; font-size: 14px;
+  cursor: pointer;
+  transition: border-radius .15s, background-color .15s;
+}
+.server:hover, .server.active { border-radius: 14px; background: var(--accent); color: #fff; }
+
+/* ---- Каналы ---- */
+.channels { background: var(--bg-1); display: flex; flex-direction: column; min-height: 0; }
+.channels-head, .chat-head {
+  height: 48px; flex: none;
+  padding: 0 16px;
+  display: flex; align-items: center;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.channels section { padding: 8px 8px 0; }
+.cat {
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .02em;
+  color: var(--text-dim);
+  padding: 8px 8px 4px;
+}
+.channel {
+  padding: 6px 8px; border-radius: 4px;
+  color: var(--text-dim); cursor: pointer;
+}
+.channel:hover { background: var(--bg-hover); color: var(--text); }
+.channel.active { background: var(--bg-active); color: var(--text); }
+.me {
+  margin-top: auto;
+  height: 52px; padding: 0 8px;
+  display: flex; align-items: center; gap: 8px;
+  background: var(--bg-0);
+  font-weight: 600; font-size: 14px;
+}
+
+/* ---- Чат ---- */
+.chat { background: var(--bg-2); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.messages { flex: 1; overflow-y: auto; contain: strict; }
+
+.msg {
+  position: absolute; top: 0; left: 0; width: 100%;
+  display: flex; gap: 16px;
+  padding: 2px 16px;
+}
+.msg.head { padding-top: 14px; }
+.msg:hover { background: #26272b; }
+
+.avatar {
+  flex: none;
+  width: 40px; height: 40px; border-radius: 50%;
+  display: grid; place-items: center;
+  color: #111; font-weight: 700;
+}
+.avatar.small { width: 32px; height: 32px; font-size: 13px; }
+
+.msg-time-gutter {
+  flex: none; width: 40px;
+  font-size: 11px; line-height: 22px; text-align: right;
+  color: var(--text-dim);
+  opacity: 0;
+}
+.msg:hover .msg-time-gutter { opacity: 1; }
+
+.msg-body { min-width: 0; }
+.msg-meta { display: flex; align-items: baseline; gap: 8px; }
+.msg-author { font-weight: 600; }
+.msg-time { font-size: 12px; color: var(--text-dim); }
+.msg-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg-image {
+  margin-top: 6px; border-radius: 8px;
+  display: grid; place-items: center;
+  color: rgba(0,0,0,.55); font-size: 13px; font-weight: 600;
+}
+
+.composer { padding: 0 16px 20px; flex: none; }
+.composer textarea {
+  width: 100%; resize: none;
+  background: var(--bg-hover); color: var(--text);
+  border: none; border-radius: 8px;
+  padding: 11px 14px;
+  font: inherit;
+  outline: none;
+}
+
+/* ---- Участники ---- */
+.members { background: var(--bg-1); padding: 12px 8px; overflow-y: auto; }
+.member {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 8px; border-radius: 4px;
+  color: var(--text-dim); cursor: pointer;
+}
+.member:hover { background: var(--bg-hover); color: var(--text); }
+
+/* ---- Диагностика (F2) ---- */
+.diag {
+  position: fixed; right: 12px; bottom: 80px;
+  background: #000c; color: #7ee08a;
+  font: 12px/1.4 ui-monospace, monospace;
+  padding: 6px 10px; border-radius: 6px;
+  pointer-events: none;
+}
+
+@media (max-width: 900px) {
+  .app { grid-template-columns: 64px 200px 1fr; }
+  .members { display: none; }
+}

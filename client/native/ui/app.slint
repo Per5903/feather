@@ -1,0 +1,374 @@
+// Прототип этапа 0: тот же экран, что и в client/ui (Tauri), но на нативном Slint.
+// Правила те же: никаких тяжёлых эффектов, анимации только простые.
+
+import { ListView } from "std-widgets.slint";
+
+export struct Msg {
+    head: bool,
+    author: string,
+    initial: string,
+    tint: color,
+    time: string,
+    text: string,
+    has-image: bool,
+    img-w: length,
+    img-h: length,
+    img-label: string,
+    img-tint: color,
+}
+
+export struct Member {
+    name: string,
+    initial: string,
+    tint: color,
+}
+
+global Theme {
+    out property <color> bg0: #111214;
+    out property <color> bg1: #1a1b1e;
+    out property <color> bg2: #222327;
+    out property <color> hover: #2b2d31;
+    out property <color> active: #34363c;
+    out property <color> row-hover: #26272b;
+    out property <color> text: #dcdee1;
+    out property <color> dim: #8e9297;
+    out property <color> accent: #6c8cff;
+    out property <color> border: #2a2b2f;
+}
+
+component Avatar inherits Rectangle {
+    in property <string> initial;
+    in property <color> tint;
+    in property <length> size: 40px;
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: tint;
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: initial;
+        color: #111;
+        font-weight: 700;
+        font-size: size * 0.38;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component SpeakerIcon inherits Path {
+    width: 14px;
+    height: 14px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    commands: "M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z";
+}
+
+component MessageRow inherits Rectangle {
+    in property <Msg> m;
+    background: ta.has-hover ? Theme.row-hover : transparent;
+    ta := TouchArea { }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: m.head ? 14px : 2px;
+        padding-bottom: 2px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: start;
+            width: 40px;
+            if m.head: Avatar {
+                initial: m.initial;
+                tint: m.tint;
+            }
+            if !m.head: Text {
+                height: 22px;
+                text: ta.has-hover ? m.time : "";
+                color: Theme.dim;
+                font-size: 11px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            if m.head: HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+                Text {
+                    text: m.author;
+                    color: m.tint;
+                    font-weight: 600;
+                }
+                Text {
+                    text: m.time;
+                    color: Theme.dim;
+                    font-size: 12px;
+                    vertical-alignment: bottom;
+                }
+            }
+            Text {
+                text: m.text;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            if m.has-image: HorizontalLayout {
+                alignment: start;
+                padding-top: 4px;
+                Rectangle {
+                    // Размер известен заранее из метаданных вложения: строка не «прыгает»
+                    width: m.img-w;
+                    height: m.img-h;
+                    border-radius: 8px;
+                    background: m.img-tint;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: m.img-label;
+                        color: #0000008c;
+                        font-size: 13px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Channel inherits Rectangle {
+    in property <string> name;
+    in property <bool> voice;
+    in property <bool> active;
+    height: 32px;
+    border-radius: 4px;
+    background: active ? Theme.active : cta.has-hover ? Theme.hover : transparent;
+    cta := TouchArea { }
+    HorizontalLayout {
+        padding-left: 8px;
+        spacing: 6px;
+        if voice: VerticalLayout {
+            alignment: center;
+            SpeakerIcon { fill: active || cta.has-hover ? Theme.text : Theme.dim; }
+        }
+        Text {
+            text: voice ? name : "# " + name;
+            color: active || cta.has-hover ? Theme.text : Theme.dim;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Category inherits Rectangle {
+    in property <string> text;
+    height: 28px;
+    Text {
+        x: 8px;
+        y: 0px;
+        height: parent.height - 4px;
+        text: root.text;
+        color: Theme.dim;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: bottom;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Feather (Slint)";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 800px;
+    min-height: 500px;
+    background: Theme.bg0;
+    default-font-size: 15px;
+
+    in property <[Msg]> messages;
+    in property <[Member]> members;
+    in property <string> me-name;
+    in property <string> me-initial;
+    in property <color> me-tint;
+    callback send(string);
+
+    // Насколько близко к низу нужно быть, чтобы список «прилипал» к новым сообщениям
+    public pure function near-bottom() -> bool {
+        list.content-y - (list.visible-height - list.content-height) < 80px
+    }
+    // Для бенчмарка: прокрутка на delta, у краёв направление меняется вызывающим кодом
+    public function scroll-by(delta: length) -> bool {
+        list.content-y = max(list.visible-height - list.content-height, min(0px, list.content-y + delta));
+        list.content-y == 0px || list.content-y == list.visible-height - list.content-height
+    }
+    public function scroll-to-bottom() {
+        list.content-y = min(0px, list.visible-height - list.content-height);
+    }
+
+    HorizontalLayout {
+        // ---- Список серверов ----
+        VerticalLayout {
+            width: 64px;
+            padding-top: 12px;
+            spacing: 8px;
+            alignment: start;
+            for s[i] in ["Ф", "R", "Кл", "WoW", "CS"]: HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    property <bool> lit: i == 0 || sta.has-hover;
+                    width: 44px;
+                    height: 44px;
+                    border-radius: lit ? 14px : 22px;
+                    background: lit ? Theme.accent : Theme.bg2;
+                    animate border-radius, background { duration: 150ms; }
+                    sta := TouchArea { }
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: s;
+                        color: lit ? #fff : Theme.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ---- Каналы ----
+        Rectangle {
+            width: 232px;
+            background: Theme.bg1;
+            VerticalLayout {
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        x: 16px;
+                        height: parent.height;
+                        text: "Феникс · гильдия";
+                        color: Theme.text;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+                VerticalLayout {
+                    padding: 8px;
+                    padding-top: 4px;
+                    spacing: 2px;
+                    Category { text: "ТЕКСТОВЫЕ"; }
+                    for c[i] in ["общий", "рейды", "мемы", "билды"]: Channel { name: c; active: i == 0; }
+                    Category { text: "ГОЛОСОВЫЕ"; }
+                    for c in ["Лобби", "Рейд", "AFK"]: Channel { name: c; voice: true; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                Rectangle {
+                    height: 52px;
+                    background: Theme.bg0;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            Avatar { size: 32px; initial: me-initial; tint: me-tint; }
+                        }
+                        Text {
+                            text: me-name;
+                            color: Theme.text;
+                            font-weight: 600;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Чат ----
+        Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg2;
+            VerticalLayout {
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        x: 16px;
+                        height: parent.height;
+                        text: "# общий";
+                        color: Theme.text;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                }
+                // ListView виртуализирован: создаются только видимые строки
+                list := ListView {
+                    vertical-stretch: 1;
+                    for m in messages: MessageRow { m: m; }
+                }
+                Rectangle {
+                    height: 64px;
+                    Rectangle {
+                        x: 16px;
+                        width: parent.width - 32px;
+                        height: 44px;
+                        border-radius: 8px;
+                        background: Theme.hover;
+                        input := TextInput {
+                            x: 14px;
+                            width: parent.width - 28px;
+                            height: parent.height;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            accepted => {
+                                if (self.text != "") {
+                                    root.send(self.text);
+                                    self.text = "";
+                                }
+                            }
+                        }
+                        if input.text == "": Text {
+                            x: 14px;
+                            height: parent.height;
+                            text: "Написать в #общий";
+                            color: Theme.dim;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Участники ----
+        Rectangle {
+            width: 220px;
+            background: Theme.bg1;
+            VerticalLayout {
+                padding: 8px;
+                padding-top: 12px;
+                spacing: 2px;
+                alignment: start;
+                Category { text: "В СЕТИ — " + members.length; }
+                for u in members: Rectangle {
+                    height: 42px;
+                    border-radius: 4px;
+                    background: mta.has-hover ? Theme.hover : transparent;
+                    mta := TouchArea { }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            Avatar { size: 32px; initial: u.initial; tint: u.tint; }
+                        }
+                        Text {
+                            text: u.name;
+                            color: mta.has-hover ? Theme.text : Theme.dim;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

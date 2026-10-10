@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["client/desktop", "client/native", "client/voice-proto"]
+
+# Релизная сборка оптимизирована по размеру: клиент должен быть лёгким
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
