@@ -154,6 +154,14 @@ impl Api {
         self.call(Method::POST, &format!("/channels/{channel}/ack"), Some(&AckRequest { message_id: message })).await
     }
 
+    pub async fn edit_message(&self, channel: Snowflake, id: Snowflake, content: &str) -> Result<Message> {
+        self.call(Method::PATCH, &format!("/channels/{channel}/messages/{id}"), Some(&EditMessageRequest { content: content.into() })).await
+    }
+
+    pub async fn delete_message(&self, channel: Snowflake, id: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/channels/{channel}/messages/{id}"), None).await
+    }
+
     pub async fn send_message(&self, channel: Snowflake, content: &str, nonce: String) -> Result<Message> {
         let req = SendMessageRequest { content: content.into(), reply_to_id: None, nonce: Some(nonce) };
         self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(&req)).await

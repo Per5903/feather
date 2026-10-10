@@ -230,6 +230,8 @@ pub enum ClientOp {
     UnsubscribeGuild { guild_id: Snowflake },
     /// Игровой режим: не присылать typing/presence, пока окно скрыто
     ClientState { background: bool },
+    /// Я печатаю в канале (клиент шлёт не чаще раза в несколько секунд)
+    Typing { channel_id: Snowflake },
     /// Я зашёл в голосовой канал / вышел (None) / переключил микрофон или звук
     VoiceState { channel_id: Option<Snowflake>, muted: bool, deafened: bool },
 }
@@ -267,6 +269,8 @@ pub enum Event {
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
     VoiceStateUpdate(VoiceState),
+    /// Кто-то начал печатать (показывать ~10 секунд или до его сообщения)
+    TypingStart { channel_id: Snowflake, user: User },
     /// Пользователь дочитал канал (на этом или другом своём устройстве)
     ChannelAck { channel_id: Snowflake, message_id: Snowflake },
     /// По неподписанным серверам приходят только счётчики

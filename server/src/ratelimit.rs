@@ -21,6 +21,8 @@ pub struct Rule {
 
 /// Вход и регистрация: перебор паролей должен быть медленным
 pub const AUTH: Rule = Rule { burst: 10.0, per_sec: 10.0 / 60.0 };
+/// «Печатает»: клиент шлёт раз в 8 с; с запасом — 3 подряд, затем раз в 3 с
+pub const TYPING: Rule = Rule { burst: 3.0, per_sec: 1.0 / 3.0 };
 /// Сообщения: 5 подряд, дальше одно в секунду
 pub const MESSAGES: Rule = Rule { burst: 5.0, per_sec: 1.0 };
 

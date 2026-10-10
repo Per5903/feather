@@ -55,6 +55,8 @@ impl Feed {
             time: hhmm(m.ts_ms),
             text: m.text.as_str().into(),
             edited: false,
+            own: false,
+            can_delete: false,
             has_image: m.image.is_some(),
             img_w,
             img_h,

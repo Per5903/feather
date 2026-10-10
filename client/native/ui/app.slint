@@ -11,6 +11,9 @@ export struct Msg {
     time: string,
     text: string,
     edited: bool,
+    /// Своё сообщение (можно редактировать) / можно удалить (своё или я владелец сервера)
+    own: bool,
+    can-delete: bool,
     has-image: bool,
     img-w: length,
     img-h: length,
@@ -109,6 +112,8 @@ component IconButton inherits Rectangle {
 
 component MessageRow inherits Rectangle {
     in property <Msg> m;
+    callback edit();
+    callback delete();
     background: ta.has-hover ? Theme.row-hover : transparent;
     ta := TouchArea { }
     HorizontalLayout {
@@ -174,6 +179,28 @@ component MessageRow inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+            }
+        }
+    }
+    // Действия при наведении: изменить / удалить
+    if ta.has-hover && (m.own || m.can-delete): Rectangle {
+        x: parent.width - self.width - 16px;
+        y: 4px;
+        width: actions.preferred-width;
+        height: 28px;
+        border-radius: 6px;
+        background: Theme.bg1;
+        border-width: 1px;
+        border-color: Theme.border;
+        actions := HorizontalLayout {
+            padding: 0px;
+            if m.own: IconButton {
+                icon: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z";
+                clicked => { root.edit(); }
+            }
+            if m.can-delete: IconButton {
+                icon: "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z";
+                clicked => { root.delete(); }
             }
         }
     }
@@ -555,6 +582,16 @@ export component AppWindow inherits Window {
     callback leave-voice();
     callback select-channel(int);
     callback send(string);
+    /// Текст в поле ввода (Rust подставляет его при редактировании)
+    in-out property <string> composer-text;
+    /// Редактируется сообщение (поле ввода в режиме правки)
+    in property <bool> editing;
+    /// «Шторм печатает…»
+    in property <string> typing-text;
+    callback edit-message(int);
+    callback delete-message(int);
+    callback cancel-edit();
+    callback typing();
     callback create-guild-dialog();
     callback join-guild-dialog();
     callback invite();
@@ -838,16 +875,45 @@ export component AppWindow inherits Window {
                             root.load-older();
                         }
                     }
-                    for m in messages: MessageRow { m: m; }
+                    for m[i] in messages: MessageRow {
+                        m: m;
+                        edit => { root.edit-message(i); }
+                        delete => { root.delete-message(i); }
+                    }
+                }
+                if editing: HorizontalLayout {
+                    padding-left: 18px;
+                    padding-right: 16px;
+                    height: 24px;
+                    Text {
+                        text: "Редактирование сообщения · Enter — сохранить";
+                        color: Theme.accent;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    TouchArea {
+                        width: 70px;
+                        clicked => { root.cancel-edit(); }
+                        Text {
+                            text: "Отмена";
+                            color: Theme.dim;
+                            font-size: 12px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
                 Rectangle {
-                    height: 64px;
+                    height: 44px;
                     Rectangle {
                         x: 16px;
                         width: parent.width - 32px;
                         height: 44px;
                         border-radius: 8px;
                         background: Theme.hover;
+                        border-width: editing ? 1px : 0px;
+                        border-color: Theme.accent;
                         input := TextInput {
                             x: 14px;
                             width: parent.width - 28px;
@@ -855,10 +921,12 @@ export component AppWindow inherits Window {
                             color: Theme.text;
                             vertical-alignment: center;
                             read-only: !can-write;
+                            text <=> root.composer-text;
+                            edited => { root.typing(); }
                             accepted => {
                                 if (self.text != "" && can-write) {
                                     root.send(self.text);
-                                    self.text = "";
+                                    root.composer-text = "";
                                 }
                             }
                         }
@@ -869,6 +937,17 @@ export component AppWindow inherits Window {
                             color: Theme.dim;
                             vertical-alignment: center;
                         }
+                    }
+                }
+                // «… печатает» — тонкая строка под полем ввода (место зарезервировано, лента не прыгает)
+                HorizontalLayout {
+                    height: 20px;
+                    padding-left: 18px;
+                    Text {
+                        text: typing-text;
+                        color: Theme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
                     }
                 }
             }
@@ -947,6 +1026,15 @@ export component AppWindow inherits Window {
         save => { root.save-settings(); }
         cancel => { root.dialog = ""; }
         configure-ptt => { root.configure-ptt(); }
+    }
+    if dialog == "delete": Dialog {
+        title: "Удалить сообщение?";
+        hint: "Его удалят у всех. Отменить нельзя.";
+        ok-text: "Удалить";
+        read-only: true;
+        value <=> root.dialog-value;
+        ok => { root.dialog-ok(); }
+        cancel => { root.dialog = ""; }
     }
     if dialog == "invite": Dialog {
         title: "Пригласить друзей";

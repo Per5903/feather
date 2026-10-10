@@ -186,6 +186,15 @@ impl Session {
                             subscribed.remove(&guild_id);
                         }
                         ClientOp::ClientState { background: b } => background = b,
+                        ClientOp::Typing { channel_id } => {
+                            // Лимит, чтобы «печатает» нельзя было превратить в спам событиями
+                            if st.limiter.check(&format!("typing:{}", me_user.id), crate::ratelimit::TYPING).is_ok()
+                                && let Ok((channel, _)) = channel_for_member(&st.db, channel_id, me_user.id).await
+                                && channel.kind == ChannelKind::Text
+                            {
+                                st.bus.publish(Target::Guild(channel.guild_id), Event::TypingStart { channel_id, user: me_user.clone() });
+                            }
+                        }
                         ClientOp::VoiceState { channel_id, muted, deafened } => {
                             voice_state(&st, &session_id, &me_user, channel_id, muted, deafened).await?;
                         }
@@ -220,9 +229,15 @@ fn route(
     me: Snowflake,
     member_of: &mut HashSet<Snowflake>,
     subscribed: &HashSet<Snowflake>,
-    _background: bool,
+    background: bool,
 ) -> Option<Event> {
     let (target, event) = env.as_ref();
+    // «Печатает»: не автору и не свёрнутым клиентам (игровой режим, docs/02-performance.md)
+    if let Event::TypingStart { user, .. } = event
+        && (user.id == me || background)
+    {
+        return None;
+    }
     match *target {
         Target::User(uid) if uid == me => {
             if let Event::GuildCreate(g) = event {

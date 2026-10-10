@@ -140,6 +140,10 @@ fn wire_callbacks(ui: &AppWindow) {
         }
     }));
     ui.on_send(|text| post(move |app| app.send(text.trim().to_owned())));
+    ui.on_edit_message(|i| post(move |app| app.start_edit(i as usize)));
+    ui.on_cancel_edit(|| post(|app| app.cancel_edit()));
+    ui.on_delete_message(|i| post(move |app| app.ask_delete(i as usize)));
+    ui.on_typing(|| post(|app| app.on_local_typing()));
     ui.on_load_older(|| post(|app| app.load_older()));
     ui.on_toggle_mute(|| post(|app| app.toggle_mute()));
     ui.on_open_settings(|| post(|app| app.open_settings()));
@@ -179,7 +183,7 @@ fn ordered(mut cs: Vec<Channel>) -> Vec<Channel> {
     out
 }
 
-fn msg_row(prev: Option<&Message>, m: &Message) -> Msg {
+fn msg_row(prev: Option<&Message>, m: &Message, me: Snowflake, moderator: bool) -> Msg {
     let ts = m.id.timestamp_ms();
     let head = prev.is_none_or(|p| p.author.id != m.author.id || ts.saturating_sub(p.id.timestamp_ms()) > GROUP_GAP_MS);
     let name = m.author.display_name.as_deref().unwrap_or(&m.author.username);
@@ -191,9 +195,26 @@ fn msg_row(prev: Option<&Message>, m: &Message) -> Msg {
         time: time_label(ts as i64),
         text: m.content.as_str().into(),
         edited: m.edited_at.is_some(),
+        own: m.author.id == me,
+        can_delete: m.author.id == me || moderator,
         ..Default::default()
     }
 }
+
+/// «Шторм печатает…», «Шторм и Лиса печатают…», «Несколько человек печатают…»
+fn typing_label(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [a] => format!("{a} печатает…"),
+        [a, b] => format!("{a} и {b} печатают…"),
+        _ => "Несколько человек печатают…".into(),
+    }
+}
+
+/// Сколько показывать «печатает» после последнего сигнала
+const TYPING_SHOW: Duration = Duration::from_secs(10);
+/// Как часто сам клиент сообщает «я печатаю»
+const TYPING_SEND_EVERY: Duration = Duration::from_secs(8);
 
 /// Голосовой канал, в котором мы сейчас
 struct Voice {
@@ -253,6 +274,14 @@ struct App {
     /// Глобальная клавиша push-to-talk (пока включён режим PTT)
     hotkey: Option<HotkeyHandle>,
     ptt_pressed: bool,
+    /// Редактируемое сообщение
+    editing: Option<Snowflake>,
+    /// Сообщение, ожидающее подтверждения удаления
+    pending_delete: Option<Snowflake>,
+    /// Кто печатает в открытом канале: пользователь → (имя, когда сообщил)
+    typing: HashMap<Snowflake, (String, std::time::Instant)>,
+    last_typing_sent: Option<std::time::Instant>,
+    typing_timer: Timer,
     /// Списки устройств, показанные в настройках (индексы ComboBox → имена)
     device_lists: (Vec<String>, Vec<String>),
 }
@@ -297,6 +326,11 @@ impl App {
             settings: settings::load(),
             hotkey: None,
             ptt_pressed: false,
+            editing: None,
+            pending_delete: None,
+            typing: HashMap::new(),
+            last_typing_sent: None,
+            typing_timer: Timer::default(),
             device_lists: (Vec::new(), Vec::new()),
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
@@ -429,8 +463,17 @@ impl App {
         ui.set_members(ModelRc::new(VecModel::from(items)));
     }
 
+    /// Я владелец открытого сервера — могу удалять чужие сообщения
+    fn moderator(&self) -> bool {
+        self.guild.and_then(|g| self.guilds.iter().find(|x| x.id == g)).is_some_and(|g| g.owner_id == self.me.id)
+    }
+
+    fn row_at(&self, i: usize) -> Msg {
+        msg_row(i.checked_sub(1).map(|p| &self.messages[p]), &self.messages[i], self.me.id, self.moderator())
+    }
+
     fn rebuild_messages(&self) {
-        let rows: Vec<Msg> = self.messages.iter().enumerate().map(|(i, m)| msg_row(i.checked_sub(1).map(|p| &self.messages[p]), m)).collect();
+        let rows: Vec<Msg> = (0..self.messages.len()).map(|i| self.row_at(i)).collect();
         self.model.set_vec(rows);
     }
 
@@ -506,6 +549,9 @@ impl App {
             Kind::Text => {}
         }
         self.set_status("");
+        self.typing.clear();
+        self.refresh_typing();
+        self.cancel_edit();
         self.channel = Some(c.id);
         session::remember(&c.guild_id.to_string(), &c.id.to_string());
         self.unread.remove(&c.id);
@@ -538,6 +584,12 @@ impl App {
                         app.rebuild_messages();
                         app.scroll_to_bottom_later();
                         app.ack_latest();
+                        // Для снимков интерфейса в автотестах: открыть правку своего последнего сообщения
+                        if std::env::var_os("FEATHER_TEST_EDIT").is_some()
+                            && let Some(i) = app.messages.iter().rposition(|m| m.author.id == app.me.id)
+                        {
+                            app.start_edit(i);
+                        }
                     }
                     Err(e) => app.set_status(format!("Не удалось загрузить историю: {e}")),
                 }
@@ -578,9 +630,7 @@ impl App {
                 older.append(&mut app.messages);
                 app.messages = older;
                 // Перестраиваем добавленные строки и первую старую (у неё могла пропасть шапка)
-                let rows: Vec<Msg> = (0..=added.min(app.messages.len() - 1))
-                    .map(|i| msg_row(i.checked_sub(1).map(|p| &app.messages[p]), &app.messages[i]))
-                    .collect();
+                let rows: Vec<Msg> = (0..=added.min(app.messages.len() - 1)).map(|i| app.row_at(i)).collect();
                 let first_old = rows[added.min(rows.len() - 1)].clone();
                 for (i, row) in rows.into_iter().take(added).enumerate() {
                     app.model.insert(i, row);
@@ -613,12 +663,86 @@ impl App {
             self.messages.sort_by_key(|x| x.id);
             self.rebuild_messages();
         } else {
-            let row = msg_row(self.messages.last(), &m);
             self.messages.push(m);
+            let row = self.row_at(self.messages.len() - 1);
             self.model.push(row);
         }
         if stick {
             self.scroll_to_bottom_later();
+        }
+    }
+
+    // ------------------------------------------------------------ правка, удаление, «печатает»
+
+    fn set_editing_ui(&self, on: bool) {
+        if let Some(ui) = self.ui() {
+            ui.set_editing(on);
+            if !on {
+                ui.set_composer_text(SharedString::new());
+            }
+        }
+    }
+
+    fn start_edit(&mut self, i: usize) {
+        let Some(m) = self.messages.get(i).filter(|m| m.author.id == self.me.id) else { return };
+        self.editing = Some(m.id);
+        if let Some(ui) = self.ui() {
+            ui.set_composer_text(m.content.as_str().into());
+            ui.set_editing(true);
+        }
+    }
+
+    fn cancel_edit(&mut self) {
+        self.editing = None;
+        self.set_editing_ui(false);
+    }
+
+    fn ask_delete(&mut self, i: usize) {
+        let Some(m) = self.messages.get(i) else { return };
+        if m.author.id != self.me.id && !self.moderator() {
+            return;
+        }
+        self.pending_delete = Some(m.id);
+        if let Some(ui) = self.ui() {
+            // Показываем, что именно удаляем (коротко)
+            let preview: String = m.content.chars().take(80).collect();
+            ui.set_dialog_value(preview.into());
+            ui.set_dialog("delete".into());
+        }
+    }
+
+    fn delete_confirmed(&mut self) {
+        let (Some(id), Some(channel)) = (self.pending_delete.take(), self.channel) else { return };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = api.delete_message(channel, id).await {
+                post(move |app| app.set_status(format!("Не удалось удалить: {e}")));
+            }
+            // Само удаление из ленты придёт событием MESSAGE_DELETE
+        });
+    }
+
+    fn on_local_typing(&mut self) {
+        let Some(channel) = self.channel else { return };
+        if self.editing.is_some() || self.last_typing_sent.is_some_and(|t| t.elapsed() < TYPING_SEND_EVERY) {
+            return;
+        }
+        self.last_typing_sent = Some(std::time::Instant::now());
+        self.gw_send(ClientOp::Typing { channel_id: channel });
+    }
+
+    fn refresh_typing(&mut self) {
+        self.typing.retain(|_, (_, at)| at.elapsed() < TYPING_SHOW);
+        let mut names: Vec<&str> = self.typing.values().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        if let Some(ui) = self.ui() {
+            ui.set_typing_text(typing_label(&names).into());
+        }
+        // Пока кто-то печатает — раз в секунду проверяем, не пора ли убрать надпись
+        if self.typing.is_empty() {
+            self.typing_timer.stop();
+        } else if !self.typing_timer.running() {
+            self.typing_timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), || post(|app| app.refresh_typing()));
         }
     }
 
@@ -639,6 +763,27 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if let Some(id) = self.editing.take() {
+            self.set_editing_ui(false);
+            if self.messages.iter().any(|m| m.id == id && m.content == text) {
+                return; // ничего не поменялось
+            }
+            let api = self.api.clone();
+            self.rt.spawn(async move {
+                let res = api.edit_message(channel, id, &text).await;
+                post(move |app| match res {
+                    Ok(m) => {
+                        if let Some(i) = app.messages.iter().position(|x| x.id == m.id) {
+                            app.messages[i] = m;
+                            app.model.set_row_data(i, app.row_at(i));
+                        }
+                    }
+                    Err(e) => app.set_status(format!("Не удалось изменить: {e}")),
+                });
+            });
+            return;
+        }
+        self.last_typing_sent = None; // после отправки следующий набор снова сообщаем сразу
         let nonce = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
         let api = self.api.clone();
         self.rt.spawn(async move {
@@ -702,7 +847,17 @@ impl App {
 
     fn on_event(&mut self, event: Event) {
         match event {
+            Event::TypingStart { channel_id, user } => {
+                if Some(channel_id) == self.channel {
+                    let name = user.display_name.clone().unwrap_or(user.username.clone());
+                    self.typing.insert(user.id, (name, std::time::Instant::now()));
+                    self.refresh_typing();
+                }
+            }
             Event::MessageCreate(m) => {
+                if self.typing.remove(&m.author.id).is_some() {
+                    self.refresh_typing();
+                }
                 if Some(m.channel_id) == self.channel {
                     self.add_message(m);
                     self.ack_latest();
@@ -715,9 +870,8 @@ impl App {
             }
             Event::MessageUpdate(m) => {
                 if let Some(i) = self.messages.iter().position(|x| x.id == m.id) {
-                    let row = msg_row(i.checked_sub(1).map(|p| &self.messages[p]), &m);
                     self.messages[i] = m;
-                    self.model.set_row_data(i, row);
+                    self.model.set_row_data(i, self.row_at(i));
                 }
             }
             Event::MessageDelete { id, .. } => {
@@ -726,8 +880,10 @@ impl App {
                     self.model.remove(i);
                     // У следующего сообщения могла появиться (или пропасть) шапка
                     if i < self.messages.len() {
-                        let row = msg_row(i.checked_sub(1).map(|p| &self.messages[p]), &self.messages[i]);
-                        self.model.set_row_data(i, row);
+                        self.model.set_row_data(i, self.row_at(i));
+                    }
+                    if self.editing == Some(id) {
+                        self.cancel_edit();
                     }
                 }
             }
@@ -994,6 +1150,11 @@ impl App {
     fn dialog_ok(&mut self) {
         let Some(ui) = self.ui() else { return };
         let (kind, value) = (ui.get_dialog().to_string(), ui.get_dialog_value().trim().to_owned());
+        if kind == "delete" {
+            ui.set_dialog(SharedString::new());
+            self.delete_confirmed();
+            return;
+        }
         if value.is_empty() {
             return;
         }

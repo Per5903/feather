@@ -451,3 +451,42 @@ async fn rate_limits() {
     assert_eq!(err.unwrap().code, "rate_limited");
     srv.drop_db().await;
 }
+
+#[tokio::test]
+async fn typing() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "T".into() }).await;
+    let g = g.unwrap();
+    let text = g.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{}/invites", g.guild.id), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", inv.unwrap().code), Some(&bob.token), &()).await;
+
+    let (mut bob_gw, _) = GatewayClient::connect(srv.addr, &bob.token).await;
+    bob_gw.send(&ClientOp::SubscribeGuild { guild_id: g.guild.id }).await;
+    let (mut alice_gw, _) = GatewayClient::connect(srv.addr, &alice.token).await;
+    alice_gw.send(&ClientOp::SubscribeGuild { guild_id: g.guild.id }).await;
+    bob_gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
+    assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck);
+
+    alice_gw.send(&ClientOp::Typing { channel_id: text }).await;
+    match bob_gw.next_event().await {
+        Event::TypingStart { channel_id, user } => assert_eq!((channel_id, user.username.as_str()), (text, "alice")),
+        other => panic!("ожидался TYPING_START, пришло {other:?}"),
+    }
+    // Себе «печатает» не приходит
+    alice_gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
+    assert_eq!(alice_gw.next().await, ServerOp::HeartbeatAck);
+
+    // Свёрнутому клиенту (игровой режим) — тоже нет
+    bob_gw.send(&ClientOp::ClientState { background: true }).await;
+    bob_gw.send(&ClientOp::Heartbeat { seq: 1 }).await;
+    assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck);
+    alice_gw.send(&ClientOp::Typing { channel_id: text }).await;
+    bob_gw.send(&ClientOp::Heartbeat { seq: 2 }).await;
+    assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck, "в игровом режиме TYPING не приходит");
+
+    drop((alice_gw, bob_gw));
+    srv.drop_db().await;
+}

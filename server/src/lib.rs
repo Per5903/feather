@@ -8,7 +8,7 @@ mod gateway;
 mod guilds;
 mod ids;
 mod messages;
-mod ratelimit;
+pub(crate) mod ratelimit;
 mod voice;
 mod voice_states;
 
