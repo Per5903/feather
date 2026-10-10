@@ -187,7 +187,12 @@ fn route(
         Target::Guild(gid) if subscribed.contains(&gid) => Some(event.clone()),
         // Сервер не открыт: только счётчик непрочитанного
         Target::Guild(gid) => match event {
-            Event::MessageCreate(m) => Some(Event::UnreadUpdate { guild_id: gid, channel_id: m.channel_id, last_message_id: m.id }),
+            Event::MessageCreate(m) => Some(Event::UnreadUpdate {
+                guild_id: gid,
+                channel_id: m.channel_id,
+                last_message_id: m.id,
+                author_id: m.author.id,
+            }),
             _ => None,
         },
     }

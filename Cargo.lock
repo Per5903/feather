@@ -2261,6 +2261,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "feather-core"
+version = "0.0.1"
+dependencies = [
+ "feather-protocol",
+ "futures-util",
+ "reqwest 0.13.5",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
 name = "feather-denoise-bench"
 version = "0.0.1"
 dependencies = [
@@ -2281,9 +2295,15 @@ dependencies = [
 name = "feather-native"
 version = "0.0.1"
 dependencies = [
+ "chrono",
+ "feather-core",
+ "feather-protocol",
  "png 0.18.1",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
+ "tokio",
 ]
 
 [[package]]
@@ -8509,7 +8529,11 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.30.0",
 ]
 
@@ -8817,6 +8841,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.21",
 ]

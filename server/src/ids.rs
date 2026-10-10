@@ -4,11 +4,11 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use feather_protocol::Snowflake;
+use feather_protocol::{FEATHER_EPOCH_MS as EPOCH_MS, SNOWFLAKE_TIME_SHIFT, Snowflake};
 
-const EPOCH_MS: u64 = 1_767_225_600_000; // 2026-01-01T00:00:00Z
 const SEQ_BITS: u64 = 12;
 const WORKER_BITS: u64 = 10;
+const _: () = assert!(SEQ_BITS + WORKER_BITS == SNOWFLAKE_TIME_SHIFT as u64);
 
 pub struct Snowflakes {
     worker: u64,
@@ -57,5 +57,7 @@ mod tests {
         let ids: Vec<u64> = (0..20_000).map(|_| ids_gen.next().0).collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
         assert!(ids.iter().all(|&id| id < i64::MAX as u64));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        assert!(Snowflake(ids[0]).timestamp_ms().abs_diff(now) < 1000, "время читается обратно из ID");
     }
 }

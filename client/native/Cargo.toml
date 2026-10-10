@@ -4,8 +4,17 @@ version = "0.0.1"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "feather"
+path = "src/main.rs"
+
 [dependencies]
-# Без Qt-бэкенда: только winit + два рендерера (OpenGL и программный), чтобы сравнить их
+feather-core = { path = "../core" }
+feather-protocol = { path = "../../crates/protocol" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Без Qt-бэкенда: winit + рендереры OpenGL (по умолчанию, D13) и программный («экономный режим»)
 slint = { version = "1.18", default-features = false, features = [
     "std",
     "compat-1-2",
@@ -14,8 +23,8 @@ slint = { version = "1.18", default-features = false, features = [
     "renderer-software",
     "accessibility",
 ] }
-
-# Только для снимков окна в режиме FEATHER_SNAPSHOT (прототип)
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# Только для снимков окна в режиме FEATHER_SNAPSHOT (проверки и скриншоты)
 png = "0.18"
 
 [build-dependencies]

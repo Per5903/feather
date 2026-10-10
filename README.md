@@ -33,7 +33,7 @@
 ## Статус
 
 - **Этап 0 (прототипы рисков):** почти завершён. Результаты замеров в [bench/README.md](bench/README.md). Осталось проверить с человеком push-to-talk поверх игры и настоящий захват экрана.
-- **Этап 1 (текстовое MVP):** готов сервер (регистрация, серверы, каналы, инвайты, сообщения, realtime-шлюз, токены голоса). Дальше роли и права, файлы, клиент на Slint.
+- **Этап 1 (текстовое MVP):** работает переписка: сервер (регистрация, серверы, каналы, инвайты, сообщения, realtime-шлюз) и клиент на Slint (вход, серверы, каналы, живые сообщения, приглашения, переподключение). Клиент: 82 МБ RAM (18 МБ в экономном режиме) против 871 МБ у Discord. Дальше роли и права, отметки о прочтении, файлы.
 
 ## Как запустить
 
@@ -50,15 +50,20 @@ cargo run --release -p feather-server
 # Тесты сервера (создают и удаляют временную базу)
 cargo test -p feather-protocol -p feather-server
 
-# Прототип клиента на Slint
+# Клиент (по умолчанию подключается к http://127.0.0.1:8080)
 cargo run --release -p feather-native
+# второй клиент на той же машине — с отдельной сохранённой сессией
+FEATHER_PROFILE=second cargo run --release -p feather-native
+# демо без сервера: 10 000 сообщений, для замеров
+FEATHER_DEMO=1 cargo run --release -p feather-native
 ```
 
 | Каталог | Что это |
 |---|---|
 | `server/` | feather-server (Rust, axum, Postgres) |
 | `crates/protocol/` | общие типы API и шлюза |
-| `client/native/` | клиент на Slint (прототип интерфейса) |
+| `client/native/` | клиент на Slint (бинарник `feather`) |
+| `client/core/` | ядро клиента без UI: REST и шлюз |
 | `client/voice-proto/` | прототип голоса и видео на LiveKit |
 | `client/ptt-proto/` | прототип глобального push-to-talk (Wayland) |
 | `client/desktop/`, `client/ui/` | старый прототип на Tauri, только для сравнения |

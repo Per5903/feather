@@ -11,6 +11,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Snowflake(pub u64);
 
+/// Эпоха Feather: 2026-01-01T00:00:00Z, мс Unix
+pub const FEATHER_EPOCH_MS: u64 = 1_767_225_600_000;
+/// Биты узла и счётчика под временем (10 + 12)
+pub const SNOWFLAKE_TIME_SHIFT: u32 = 22;
+
+impl Snowflake {
+    /// Время создания объекта, мс Unix: отдельное поле created_at не нужно
+    pub fn timestamp_ms(self) -> u64 {
+        (self.0 >> SNOWFLAKE_TIME_SHIFT) + FEATHER_EPOCH_MS
+    }
+}
+
 impl fmt::Display for Snowflake {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -220,7 +232,8 @@ pub enum Event {
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
     /// По неподписанным серверам приходят только счётчики
-    UnreadUpdate { guild_id: Snowflake, channel_id: Snowflake, last_message_id: Snowflake },
+    /// `author_id` — чтобы клиент не помечал непрочитанными свои же сообщения (с другого устройства)
+    UnreadUpdate { guild_id: Snowflake, channel_id: Snowflake, last_message_id: Snowflake, author_id: Snowflake },
 }
 
 impl Event {
