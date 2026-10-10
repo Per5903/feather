@@ -31,3 +31,5 @@ png = "0.18"
 
 [build-dependencies]
 slint-build = "1.18"
+# Иконка и сведения о программе в feather.exe (используется только при сборке под Windows)
+winresource = "0.1"

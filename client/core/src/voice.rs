@@ -37,6 +37,39 @@ const VAD_THRESHOLD: f32 = 0.6;
 const ENERGY_GATE_RMS: f64 = 330.0;
 /// После речи держим передачу ещё 400 мс: не обрезаем окончания слов и короткие паузы
 const GATE_HANGOVER_FRAMES: u32 = 40;
+/// Линейный пересчёт частоты моно-потока: для устройств не на 48 кГц
+/// (на Windows WASAPI в общем режиме часто 44,1 кГц). Для голоса качества хватает.
+pub struct Resampler {
+    /// Сколько входных сэмплов на один выходной
+    step: f64,
+    /// Позиция следующего выходного сэмпла относительно начала очередного куска; −1 — `prev`
+    pos: f64,
+    prev: f32,
+}
+
+impl Resampler {
+    pub fn new(from: u32, to: u32) -> Self {
+        Self { step: from as f64 / to as f64, pos: 0.0, prev: 0.0 }
+    }
+
+    pub fn process(&mut self, input: &[f32], mut emit: impl FnMut(f32)) {
+        if input.is_empty() {
+            return;
+        }
+        let n = input.len() as f64;
+        while self.pos < n - 1.0 {
+            let i = self.pos.floor();
+            let frac = (self.pos - i) as f32;
+            let a = if i < 0.0 { self.prev } else { input[i as usize] };
+            let b = input[(i + 1.0) as usize];
+            emit(a + (b - a) * frac);
+            self.pos += self.step;
+        }
+        self.pos -= n;
+        self.prev = input[input.len() - 1];
+    }
+}
+
 /// Размер буфера устройства оставляем системе. Замер 11: фиксированный буфер 20 мс в бэкенде
 /// PulseAudio поднял нагрузку аудиопотока с 3,4 до 8,7 % — хуже, а не лучше.
 fn with_buffer<S>(mut build: impl FnMut(cpal::BufferSize) -> Option<S>) -> Option<S> {
@@ -263,23 +296,36 @@ fn audio_devices(
 
     let cap = Arc::new(Mutex::new(cap));
     let input = input_dev.and_then(|dev| {
-        let channels = dev.default_input_config().ok()?.channels();
+        let default = dev.default_input_config().ok()?;
+        let channels = default.channels();
         let ch = channels as usize;
-        with_buffer(|buffer_size| {
-            let cap = cap.clone();
-            dev.build_input_stream::<f32, _, _>(
-                cpal::StreamConfig { channels, sample_rate: SAMPLE_RATE, buffer_size },
-                move |data, _| {
-                    // Колбэк один, блокировка никогда не ждёт; сводим в моно средним каналов
-                    let Ok(mut cap) = cap.try_lock() else { return };
-                    for frame in data.chunks(ch) {
-                        let _ = cap.try_push(frame.iter().sum::<f32>() / ch as f32);
-                    }
-                },
-                |e| eprintln!("микрофон: {e}"),
-                None,
-            )
-            .ok()
+        // Сначала 48 кГц; не согласно устройство — его родная частота и пересчёт
+        [SAMPLE_RATE, default.sample_rate()].into_iter().find_map(|rate| {
+            with_buffer(|buffer_size| {
+                let cap = cap.clone();
+                let mut rs = (rate != SAMPLE_RATE).then(|| Resampler::new(rate, SAMPLE_RATE));
+                let mut mono = Vec::new();
+                dev.build_input_stream::<f32, _, _>(
+                    cpal::StreamConfig { channels, sample_rate: rate, buffer_size },
+                    move |data, _| {
+                        // Колбэк один, блокировка никогда не ждёт; сводим в моно средним каналов
+                        let Ok(mut cap) = cap.try_lock() else { return };
+                        mono.clear();
+                        mono.extend(data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
+                        match rs.as_mut() {
+                            Some(rs) => rs.process(&mono, |s| {
+                                let _ = cap.try_push(s);
+                            }),
+                            None => {
+                                let _ = cap.push_slice(&mono);
+                            }
+                        }
+                    },
+                    |e| eprintln!("микрофон: {e}"),
+                    None,
+                )
+                .ok()
+            })
         })
     });
     if input.is_none() {
@@ -288,45 +334,64 @@ fn audio_devices(
 
     let rev = Arc::new(Mutex::new(rev));
     let output = output_dev.and_then(|dev| {
-        let channels = dev.default_output_config().ok()?.channels();
+        let default = dev.default_output_config().ok()?;
+        let channels = default.channels();
         let ch = channels as usize;
-        with_buffer(|buffer_size| {
-        let shared = shared.clone();
-        let rev = rev.clone();
-        let mut mono = Vec::<f32>::new();
-        let mut tmp = Vec::<f32>::new();
-        dev.build_output_stream::<f32, _, _>(
-            cpal::StreamConfig { channels, sample_rate: SAMPLE_RATE, buffer_size },
-            move |out: &mut [f32], _| {
-                let frames = out.len() / ch;
-                mono.clear();
-                mono.resize(frames, 0.0);
-                // try_lock: аудиопоток никогда не ждёт; в редкий момент смены участников — тишина
-                if let Ok(mut mixer) = shared.mixer.try_lock() {
-                    for (_, cons) in mixer.iter_mut() {
-                        tmp.clear();
-                        tmp.resize(frames, 0.0);
-                        let n = cons.pop_slice(&mut tmp);
-                        for (m, s) in mono.iter_mut().zip(&tmp[..n]) {
-                            *m += s;
+        [SAMPLE_RATE, default.sample_rate()].into_iter().find_map(|rate| {
+            with_buffer(|buffer_size| {
+                let shared = shared.clone();
+                let rev = rev.clone();
+                let mut rs = (rate != SAMPLE_RATE).then(|| Resampler::new(SAMPLE_RATE, rate));
+                let mut queue = std::collections::VecDeque::<f32>::new();
+                let mut mono = Vec::<f32>::new();
+                let mut tmp = Vec::<f32>::new();
+                // Смесь собеседников (48 кГц), она же опорный сигнал для эхоподавления
+                let mut mix = move |n: usize, mono: &mut Vec<f32>| {
+                    mono.clear();
+                    mono.resize(n, 0.0);
+                    // try_lock: аудиопоток никогда не ждёт; в редкий момент смены участников — тишина
+                    if let Ok(mut mixer) = shared.mixer.try_lock() {
+                        for (_, cons) in mixer.iter_mut() {
+                            tmp.clear();
+                            tmp.resize(n, 0.0);
+                            let got = cons.pop_slice(&mut tmp);
+                            for (m, s) in mono.iter_mut().zip(&tmp[..got]) {
+                                *m += s;
+                            }
                         }
                     }
-                }
-                if shared.deafened.load(Ordering::Relaxed) {
-                    mono.iter_mut().for_each(|s| *s = 0.0);
-                }
-                for (frame, s) in out.chunks_mut(ch).zip(&mono) {
-                    frame.fill(s.clamp(-1.0, 1.0));
-                }
-                // Опорный сигнал для эхоподавления: то, что ушло в динамики
-                if let Ok(mut rev) = rev.try_lock() {
-                    let _ = rev.push_slice(&mono);
-                }
-            },
-            |e| eprintln!("вывод звука: {e}"),
-            None,
-        )
-        .ok()
+                    if shared.deafened.load(Ordering::Relaxed) {
+                        mono.iter_mut().for_each(|s| *s = 0.0);
+                    }
+                    if let Ok(mut rev) = rev.try_lock() {
+                        let _ = rev.push_slice(mono);
+                    }
+                };
+                dev.build_output_stream::<f32, _, _>(
+                    cpal::StreamConfig { channels, sample_rate: rate, buffer_size },
+                    move |out: &mut [f32], _| {
+                        let frames = out.len() / ch;
+                        match rs.as_mut() {
+                            None => mix(frames, &mut mono),
+                            Some(rs) => {
+                                // Набираем 48 кГц кусками по 10 мс и пересчитываем в частоту устройства
+                                while queue.len() < frames {
+                                    mix(FRAME, &mut mono);
+                                    rs.process(&mono, |s| queue.push_back(s));
+                                }
+                                mono.clear();
+                                mono.extend(queue.drain(..frames));
+                            }
+                        }
+                        for (frame, s) in out.chunks_mut(ch).zip(&mono) {
+                            frame.fill(s.clamp(-1.0, 1.0));
+                        }
+                    },
+                    |e| eprintln!("вывод звука: {e}"),
+                    None,
+                )
+                .ok()
+            })
         })
     });
     if output.is_none() {
@@ -440,4 +505,23 @@ fn play_remote(shared: Arc<Shared>, identity: String, track: RemoteAudioTrack) {
             let _ = prod.push_slice(&buf);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Resampler;
+
+    #[test]
+    fn resampler_rates_and_continuity() {
+        // 44,1 → 48 кГц: за секунду столько же выходных сэмплов (±1), без разрывов между кусками
+        let mut rs = Resampler::new(44_100, 48_000);
+        let input: Vec<f32> = (0..44_100).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut out = Vec::new();
+        for chunk in input.chunks(441) {
+            rs.process(chunk, |s| out.push(s));
+        }
+        assert!((out.len() as i64 - 48_000).abs() <= 2, "получилось {}", out.len());
+        let max_jump = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(max_jump < 0.02, "скачок {max_jump}: разрыв на стыке кусков");
+    }
 }

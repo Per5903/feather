@@ -13,7 +13,35 @@ pub async fn pick_files() -> Vec<PathBuf> {
 
 #[cfg(not(target_os = "linux"))]
 pub async fn pick_files() -> Vec<PathBuf> {
-    Vec::new() // TODO: системный диалог Windows/macOS
+    // Системный диалог Windows/macOS; блокирующий — в отдельном потоке
+    tokio::task::spawn_blocking(|| rfd::FileDialog::new().set_title("Прикрепить файлы").pick_files().unwrap_or_default())
+        .await
+        .unwrap_or_default()
+}
+
+/// Каталог настроек: Linux ~/.config/feather, Windows %APPDATA%\Feather
+pub fn config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Feather"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|c| c.join("feather"))
+    }
+}
+
+/// Открыть файл программой по умолчанию
+pub fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
 /// file:///home/user/%D0%A1%D0%BA%D1%80%D0%B8%D0%BD.png → путь
@@ -52,6 +80,10 @@ pub fn content_type(path: &std::path::Path) -> &'static str {
 
 /// Куда сохранять скачанное: ~/Загрузки/Feather (XDG_DOWNLOAD_DIR), иначе ~/Downloads/Feather
 pub fn downloads_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile).join("Downloads").join("Feather");
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let xdg = std::fs::read_to_string(home.join(".config/user-dirs.dirs")).ok().and_then(|s| {
         s.lines().find_map(|l| l.strip_prefix("XDG_DOWNLOAD_DIR=").map(|v| v.trim_matches('"').replace("$HOME", &home.to_string_lossy())))

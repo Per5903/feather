@@ -1,6 +1,7 @@
 //! Системные уведомления (личные сообщения, упоминания).
 //! Linux: XDG-портал Notification (тот же механизм, что у глобальных клавиш).
-//! Windows/macOS: TODO (WinRT Toast / UNUserNotificationCenter).
+//! Windows: всплывающие уведомления WinRT (Toast).
+//! macOS: TODO (UNUserNotificationCenter).
 
 use tokio::sync::mpsc;
 
@@ -36,7 +37,17 @@ async fn run(app_id: &'static str, mut rx: mpsc::UnboundedReceiver<(String, Stri
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+async fn run(_app_id: &'static str, mut rx: mpsc::UnboundedReceiver<(String, String, String)>) {
+    use tauri_winrt_notification::Toast;
+    while let Some((_key, title, body)) = rx.recv().await {
+        // COM-вызов блокирующий — в отдельном потоке. Неустановленному приложению Windows
+        // требует AppUserModelID; до установщика используем идентификатор PowerShell.
+        let _ = tokio::task::spawn_blocking(move || Toast::new(Toast::POWERSHELL_APP_ID).title(&title).text1(&body).show()).await;
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 async fn run(_app_id: &'static str, mut rx: mpsc::UnboundedReceiver<(String, String, String)>) {
     while rx.recv().await.is_some() {}
 }

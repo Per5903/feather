@@ -48,6 +48,7 @@ fn device_name() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
         .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok()) // Windows
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Feather desktop".into())
 }
@@ -155,6 +156,11 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_configure_ptt(|| post(|app| {
         if let Some(h) = &app.hotkey {
             h.configure();
+            // На Windows клавишу ловит сам Feather: подсказываем, что делать
+            #[cfg(windows)]
+            if let Some(ui) = app.ui() {
+                ui.set_ptt_key("нажмите клавишу или кнопку мыши…".into());
+            }
         }
     }));
     ui.on_toggle_deafen(|| post(|app| app.toggle_deafen()));
@@ -904,8 +910,7 @@ impl App {
                 last = Some(path);
             }
             if let Some(p) = last {
-                #[cfg(target_os = "linux")]
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+                feather_core::files::open_path(&p);
             }
         });
     }
@@ -1806,7 +1811,7 @@ impl App {
         }
         if self.hotkey.is_none() {
             let _guard = self.rt.enter();
-            self.hotkey = Some(feather_core::hotkey::register(APP_ID, |ev| post(move |app| app.on_hotkey(ev))));
+            self.hotkey = Some(feather_core::hotkey::register(APP_ID, self.settings.ptt_key.clone(), |ev| post(move |app| app.on_hotkey(ev))));
         }
     }
 
@@ -1815,6 +1820,11 @@ impl App {
             HotkeyEvent::Bound(key) => {
                 if let Some(ui) = self.ui() {
                     ui.set_ptt_key(key.as_str().into());
+                }
+                // Windows: клавишу назначают в Feather — запоминаем её в настройках
+                if !key.is_empty() && self.settings.ptt_key.as_deref() != Some(key.as_str()) {
+                    self.settings.ptt_key = Some(key.clone());
+                    settings::save(&self.settings);
                 }
                 if key.is_empty() {
                     self.set_status("Назначьте клавишу push-to-talk в открывшемся окне");
@@ -1869,6 +1879,7 @@ impl App {
             echo_cancellation: ui.get_set_echo(),
             economy_mode: ui.get_set_economy(),
             notifications: ui.get_set_notify(),
+            ptt_key: self.settings.ptt_key.clone(),
         };
         settings::save(&self.settings);
         ui.set_dialog(SharedString::new());

@@ -17,6 +17,8 @@ pub struct Settings {
     pub economy_mode: bool,
     /// Уведомления о личных сообщениях и упоминаниях
     pub notifications: bool,
+    /// Клавиша push-to-talk (Windows: «Ctrl+Alt+V», «Mouse4»; на Linux её назначает KDE)
+    pub ptt_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -29,19 +31,17 @@ impl Default for Settings {
             echo_cancellation: true,
             economy_mode: false,
             notifications: true,
+            ptt_key: None,
         }
     }
 }
 
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     let name = match std::env::var("FEATHER_PROFILE") {
         Ok(p) if !p.is_empty() => format!("settings-{p}.json"),
         _ => "settings.json".into(),
     };
-    Some(base.join("feather").join(name))
+    Some(feather_core::files::config_dir()?.join(name))
 }
 
 pub fn load() -> Settings {

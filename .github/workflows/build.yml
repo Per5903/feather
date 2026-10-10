@@ -1,0 +1,59 @@
+# Автосборка: клиент для Windows (артефакт feather-windows.zip) и проверка тестов на Linux.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-client:
+    name: Клиент для Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-client
+      - name: Тесты ядра клиента и протокола
+        run: cargo test --release -p feather-protocol -p feather-core --lib
+      - name: Сборка клиента
+        run: cargo build --release -p feather-native
+      - name: Упаковка
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/feather.exe dist/
+          Copy-Item deploy/windows/README.txt dist/
+          Compress-Archive -Path dist/* -DestinationPath feather-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feather-windows
+          path: feather-windows.zip
+
+  linux-tests:
+    name: Тесты сервера (Linux + Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: feather
+          POSTGRES_PASSWORD: feather_dev_password
+          POSTGRES_DB: feather
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U feather" --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-server
+      - name: Тесты сервера и протокола
+        run: cargo test -p feather-protocol -p feather-server
