@@ -31,6 +31,11 @@ const SAMPLE_RATE: u32 = 48_000;
 const FRAME: usize = 480;
 /// Запас колец: 200 мс. Больше — значит, обработка не успевает, лишнее выбрасываем
 const RING: usize = FRAME * 20;
+/// Сколько звука собеседника держим в очереди вывода сверх одного буфера устройства.
+/// Сеть сглаживает джиттер-буфер WebRTC, нам запас почти не нужен: всё сверх — сбрасываем,
+/// иначе после сетевого всплеска или из-за разницы часов звуковых карт задержка копится навсегда.
+const MAX_QUEUED: usize = FRAME * 6;
+const TRIM_TO: usize = FRAME * 3;
 /// Порог вероятности речи RNNoise для активации голосом
 const VAD_THRESHOLD: f32 = 0.6;
 /// Без шумодава: порог громкости (≈ −40 dBFS)
@@ -100,7 +105,19 @@ pub enum VoiceEvent {
     Speaking(Vec<String>),
     /// Некритичная проблема: например, нет микрофона — слушать можно, говорить нет
     Warning(String),
+    /// Качество связи с голосовым сервером, раз в 2 секунды
+    Stats(VoiceStats),
     Disconnected(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VoiceStats {
+    /// Пинг до голосового сервера, мс
+    pub rtt_ms: Option<u32>,
+    /// Как идёт звук: «UDP», «TCP» или «TURN» (через ретранслятор)
+    pub transport: String,
+    /// Потери входящих пакетов за последний интервал, %
+    pub loss_pct: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +232,20 @@ impl VoiceSession {
             .map(|p| VoicePeer::new(p.identity().to_string(), p.name().to_string()))
             .collect();
         on_event(VoiceEvent::Joined { me, peers });
+
+        // Пинг и потери
+        {
+            let (room, shared, on_event) = (room.clone(), shared.clone(), on_event.clone());
+            tokio::spawn(async move {
+                let mut prev = (0u64, 0i64);
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                while !shared.stop.load(Ordering::Relaxed) {
+                    tick.tick().await;
+                    let Ok(stats) = room.get_stats().await else { continue };
+                    on_event(VoiceEvent::Stats(collect_stats(&stats, &mut prev)));
+                }
+            });
+        }
 
         // События комнаты
         {
@@ -352,6 +383,10 @@ fn audio_devices(
                     // try_lock: аудиопоток никогда не ждёт; в редкий момент смены участников — тишина
                     if let Ok(mut mixer) = shared.mixer.try_lock() {
                         for (_, cons) in mixer.iter_mut() {
+                            let queued = cons.occupied_len();
+                            if queued > n + MAX_QUEUED {
+                                cons.skip(queued - n - TRIM_TO);
+                            }
                             tmp.clear();
                             tmp.resize(n, 0.0);
                             let got = cons.pop_slice(&mut tmp);
@@ -505,6 +540,62 @@ fn play_remote(shared: Arc<Shared>, identity: String, track: RemoteAudioTrack) {
             let _ = prod.push_slice(&buf);
         }
     });
+}
+
+/// Пинг по выбранной ICE-паре, протокол по локальному кандидату, потери по входящему звуку
+fn collect_stats(stats: &livekit::rtc_engine::SessionStats, prev: &mut (u64, i64)) -> VoiceStats {
+    use livekit::webrtc::stats::{IceCandidatePairState, IceCandidateType, RtcStats};
+    let mut out = VoiceStats::default();
+    // Пинг и протокол — по каналу отправки (он есть всегда, пока мы в комнате), иначе по приёму
+    for list in [&stats.publisher_stats, &stats.subscriber_stats] {
+        let selected: Vec<&str> = list
+            .iter()
+            .filter_map(|s| match s {
+                RtcStats::Transport(t) if !t.transport.selected_candidate_pair_id.is_empty() => Some(t.transport.selected_candidate_pair_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let pair = list.iter().find_map(|s| match s {
+            RtcStats::CandidatePair(p)
+                if selected.contains(&p.rtc.id.as_str())
+                    || (selected.is_empty() && p.candidate_pair.nominated && p.candidate_pair.state == Some(IceCandidatePairState::Succeeded)) =>
+            {
+                Some(&p.candidate_pair)
+            }
+            _ => None,
+        });
+        let Some(pair) = pair else { continue };
+        if pair.current_round_trip_time > 0.0 {
+            out.rtt_ms = Some((pair.current_round_trip_time * 1000.0).round() as u32);
+        }
+        out.transport = list
+            .iter()
+            .find_map(|s| match s {
+                RtcStats::LocalCandidate(c) if c.rtc.id == pair.local_candidate_id => Some(if c.local_candidate.candidate_type == Some(IceCandidateType::Relay) {
+                    "TURN".to_owned()
+                } else {
+                    c.local_candidate.protocol.to_uppercase()
+                }),
+                _ => None,
+            })
+            .unwrap_or_default();
+        break;
+    }
+    let (mut received, mut lost) = (0u64, 0i64);
+    for s in &stats.subscriber_stats {
+        if let RtcStats::InboundRtp(r) = s {
+            if r.stream.kind == "audio" {
+                received += r.received.packets_received;
+                lost += r.received.packets_lost;
+            }
+        }
+    }
+    let (d_recv, d_lost) = (received.saturating_sub(prev.0), (lost - prev.1).max(0));
+    if received >= prev.0 && d_recv + d_lost as u64 > 0 {
+        out.loss_pct = d_lost as f32 * 100.0 / (d_recv + d_lost as u64) as f32;
+    }
+    *prev = (received, lost);
+    out
 }
 
 #[cfg(test)]

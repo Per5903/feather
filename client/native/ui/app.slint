@@ -424,7 +424,7 @@ component LoginScreen inherits Rectangle {
             }
             Field {
                 label: "АДРЕС FEATHER";
-                LineEdit { text <=> root.server-url; enabled: !busy; placeholder-text: "https://chat.example.com"; }
+                LineEdit { text <=> root.server-url; enabled: !busy; placeholder-text: "например, chat.example.com"; }
             }
             Field {
                 label: "ИМЯ";
@@ -880,6 +880,9 @@ export component AppWindow inherits Window {
     /// Название голосового канала, к которому подключены; "" — не подключены
     in property <string> voice-channel;
     in property <string> voice-state;
+    // Пинг до голосового сервера, мс (-1 — ещё неизвестен) и пометки о связи (TCP, потери)
+    in property <int> voice-ping: -1;
+    in property <string> voice-net;
     in property <bool> voice-muted;
     in property <bool> voice-deafened;
     callback toggle-mute();
@@ -1137,11 +1140,26 @@ export component AppWindow inherits Window {
                                 font-size: 13px;
                                 font-weight: 600;
                             }
-                            Text {
-                                text: voice-channel;
-                                color: Theme.dim;
-                                font-size: 12px;
-                                overflow: elide;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: voice-channel;
+                                    color: Theme.dim;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                }
+                                if voice-ping >= 0: Text {
+                                    text: voice-ping + " мс";
+                                    color: voice-ping < 80 ? #3ba55c : voice-ping < 150 ? #faa61a : #ed4245;
+                                    font-size: 12px;
+                                    horizontal-stretch: 0;
+                                }
+                                if voice-net != "": Text {
+                                    text: voice-net;
+                                    color: #faa61a;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                }
                             }
                         }
                         VerticalLayout {

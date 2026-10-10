@@ -39,13 +39,21 @@ pub struct Api {
     token: Option<String>,
 }
 
+/// Адрес без схемы: для локальной разработки — `http://`, для остальных — `https://`
+pub fn normalize_base(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.contains("://") {
+        return base.to_owned();
+    }
+    let host = base.split(['/', ':']).next().unwrap_or_default();
+    let local = host == "localhost" || host.starts_with("127.") || host.starts_with("192.168.") || host.starts_with("10.");
+    format!("{}://{base}", if local { "http" } else { "https" })
+}
+
 impl Api {
-    /// `base` — адрес сервера, например `http://127.0.0.1:8080`
+    /// `base` — адрес сервера, например `https://chat.example.com` или `http://127.0.0.1:8080`
     pub fn new(base: &str) -> Self {
-        let mut base = base.trim().trim_end_matches('/').to_owned();
-        if !base.contains("://") {
-            base = format!("http://{base}");
-        }
+        let base = normalize_base(base);
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -248,5 +256,18 @@ impl Api {
             return Err(Error::Api { status: status.as_u16(), code: "http".into(), message: format!("файл недоступен ({status})") });
         }
         Ok(resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod base_tests {
+    use super::normalize_base;
+
+    #[test]
+    fn scheme_by_default() {
+        assert_eq!(normalize_base(" chat.example.com/ "), "https://chat.example.com");
+        assert_eq!(normalize_base("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base("localhost:8080"), "http://localhost:8080");
+        assert_eq!(normalize_base("http://x.test"), "http://x.test");
     }
 }

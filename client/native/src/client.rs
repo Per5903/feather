@@ -75,7 +75,7 @@ pub fn run(ui: &AppWindow, rt: Handle) {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_login_error(SharedString::new());
             ui.set_registration_hint(SharedString::new());
-            if !ui.get_register_mode() {
+            if !ui.get_register_mode() || ui.get_server_url().trim().is_empty() {
                 return;
             }
             let api = Api::new(ui.get_server_url().as_str());
@@ -125,6 +125,10 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
     let Some(ui) = weak.upgrade() else { return };
     let (server, name, password) = (ui.get_server_url().to_string(), ui.get_login_name().to_string(), ui.get_login_password().to_string());
     let invite = ui.get_login_invite().trim().to_owned();
+    if server.trim().is_empty() {
+        ui.set_login_error("Введите адрес Feather — его даёт владелец сервера".into());
+        return;
+    }
     if name.trim().is_empty() || password.is_empty() {
         ui.set_login_error("Введите имя и пароль".into());
         return;
@@ -326,6 +330,7 @@ struct Voice {
     speaking: Vec<String>,
     muted: bool,
     deafened: bool,
+    stats: feather_core::voice::VoiceStats,
     /// Номер подключения: события старой сессии после переподключения игнорируем
     id: u64,
 }
@@ -626,7 +631,26 @@ impl App {
             }
             None => ui.set_voice_channel(SharedString::new()),
         }
+        self.refresh_ping();
         self.refresh_channels();
+    }
+
+    fn refresh_ping(&self) {
+        let Some(ui) = self.ui() else { return };
+        let st = self.voice.as_ref().filter(|v| v.session.is_some()).map(|v| &v.stats);
+        let rtt = st.and_then(|s| s.rtt_ms);
+        ui.set_voice_ping(rtt.map(|r| r as i32).unwrap_or(-1));
+        let mut extra = Vec::new();
+        if let Some(st) = st {
+            // UDP — норма; TCP и ретранслятор дают задержки, о них стоит знать
+            if !st.transport.is_empty() && st.transport != "UDP" {
+                extra.push(st.transport.clone());
+            }
+            if st.loss_pct >= 1.0 {
+                extra.push(format!("потери {:.0}%", st.loss_pct));
+            }
+        }
+        ui.set_voice_net(extra.join(" · ").into());
     }
 
     /// Роли сменились: перерисовать всё, что от них зависит (цвета, кнопки, права)
@@ -1754,6 +1778,7 @@ impl App {
             session: None,
             me: self.me.id.to_string(),
             speaking: Vec::new(),
+            stats: Default::default(),
             // FEATHER_START_MUTED=1 — заходить с выключенным микрофоном
             muted: std::env::var_os("FEATHER_START_MUTED").is_some(),
             deafened: false,
@@ -1801,6 +1826,14 @@ impl App {
             VoiceEvent::Speaking(who) => v.speaking = who,
             VoiceEvent::Warning(w) => {
                 self.set_status(w);
+                return;
+            }
+            VoiceEvent::Stats(st) => {
+                // Только строка пинга: список каналов не перерисовываем
+                if st != v.stats {
+                    v.stats = st;
+                    self.refresh_ping();
+                }
                 return;
             }
             VoiceEvent::Disconnected(reason) => {
