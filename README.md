@@ -32,4 +32,35 @@
 
 ## Статус
 
-**Этап 0: проектирование и прототипы рисков.** Кода пока нет.
+- **Этап 0 (прототипы рисков):** почти завершён. Результаты замеров в [bench/README.md](bench/README.md). Осталось проверить с человеком push-to-talk поверх игры и настоящий захват экрана.
+- **Этап 1 (текстовое MVP):** готов сервер (регистрация, серверы, каналы, инвайты, сообщения, realtime-шлюз, токены голоса). Дальше роли и права, файлы, клиент на Slint.
+
+## Как запустить
+
+Нужны Docker, Rust (rustup) и pnpm (только для старого прототипа на Tauri).
+
+```bash
+# База и голосовой сервер
+cp deploy/.env.example deploy/.env
+docker compose -f deploy/docker-compose.yml up -d
+
+# Сервер: http://127.0.0.1:8080, API в /api/v1, шлюз в /gateway
+cargo run --release -p feather-server
+
+# Тесты сервера (создают и удаляют временную базу)
+cargo test -p feather-protocol -p feather-server
+
+# Прототип клиента на Slint
+cargo run --release -p feather-native
+```
+
+| Каталог | Что это |
+|---|---|
+| `server/` | feather-server (Rust, axum, Postgres) |
+| `crates/protocol/` | общие типы API и шлюза |
+| `client/native/` | клиент на Slint (прототип интерфейса) |
+| `client/voice-proto/` | прототип голоса и видео на LiveKit |
+| `client/ptt-proto/` | прототип глобального push-to-talk (Wayland) |
+| `client/desktop/`, `client/ui/` | старый прототип на Tauri, только для сравнения |
+| `bench/` | замеры ресурсов и звука |
+| `deploy/` | docker-compose для разработки |
