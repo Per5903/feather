@@ -17,9 +17,6 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
-    extra_hosts:
-      # LiveKit работает в сети хоста (нужно для UDP); Caddy достаёт его через шлюз
-      - "host.docker.internal:host-gateway"
     depends_on:
       server:
         condition: service_healthy
@@ -60,7 +57,11 @@ services:
   livekit:
     image: livekit/livekit-server:v1.13.7
     restart: unless-stopped
-    network_mode: host
+    # Сигнализация (7880) — только внутри сети compose, наружу через Caddy (HTTPS).
+    # Наружу — лишь медиа: один UDP-порт и запасной TCP.
+    ports:
+      - "7881:7881"
+      - "7882:7882/udp"
     command: --config /etc/livekit.yaml
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"

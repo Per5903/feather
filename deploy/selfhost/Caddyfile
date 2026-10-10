@@ -6,7 +6,7 @@
 	# Сигнализация LiveKit (WebSocket /rtc и API /twirp)
 	@livekit path /rtc* /twirp*
 	handle @livekit {
-		reverse_proxy host.docker.internal:7880
+		reverse_proxy livekit:7880
 	}
 
 	handle {

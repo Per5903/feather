@@ -43,6 +43,10 @@ const ONSET_RMS: f64 = 2_000.0;
 type Onsets = Arc<Mutex<VecDeque<Instant>>>;
 
 fn token(identity: &str) -> String {
+    // Готовый токен от сервера Feather (POST /channels/{id}/voice/join) — для проверки настоящего сервера
+    if let Ok(t) = std::env::var("FEATHER_LK_TOKEN") {
+        return t;
+    }
     let key = std::env::var("LIVEKIT_API_KEY").unwrap_or_else(|_| "devkey".into());
     let secret = std::env::var("LIVEKIT_API_SECRET")
         .unwrap_or_else(|_| "dev_secret_change_me_at_least_32_chars_long".into());
@@ -55,7 +59,8 @@ fn token(identity: &str) -> String {
 }
 
 async fn join(identity: &str) -> (Room, tokio::sync::mpsc::UnboundedReceiver<RoomEvent>) {
-    Room::connect(URL, &token(identity), RoomOptions::default())
+    let url = std::env::var("FEATHER_LK_URL").unwrap_or_else(|_| URL.into());
+    Room::connect(&url, &token(identity), RoomOptions::default())
         .await
         .unwrap_or_else(|e| panic!("{identity}: не удалось подключиться к LiveKit: {e}"))
 }
