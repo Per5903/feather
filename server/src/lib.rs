@@ -10,6 +10,7 @@ mod gateway;
 mod guilds;
 mod ids;
 mod messages;
+mod roles;
 pub(crate) mod ratelimit;
 mod voice;
 mod voice_states;
@@ -60,7 +61,12 @@ fn router(state: Shared) -> Router {
         .route("/guilds", post(guilds::create_guild))
         .route("/guilds/{id}", get(guilds::get_guild))
         .route("/guilds/{id}/channels", get(guilds::list_channels).post(guilds::create_channel))
-        .route("/guilds/{id}/members", get(guilds::list_members))
+        .route("/guilds/{id}/members", get(roles::list_members))
+        .route("/guilds/{id}/members/{uid}", axum::routing::delete(roles::kick))
+        .route("/guilds/{id}/members/{uid}/roles/{rid}", axum::routing::put(roles::add_member_role).delete(roles::remove_member_role))
+        .route("/guilds/{id}/roles", get(roles::list_roles).post(roles::create_role))
+        .route("/guilds/{id}/roles/{rid}", patch(roles::update_role).delete(roles::delete_role))
+        .route("/guilds/{id}/bans/{uid}", axum::routing::put(roles::ban).delete(roles::unban))
         .route("/guilds/{id}/invites", post(guilds::create_invite))
         .route("/invites/{code}", post(guilds::accept_invite))
         .route("/channels/{id}/messages", get(messages::history).post(messages::send))

@@ -556,3 +556,91 @@ async fn direct_messages() {
     drop((alice_gw, bob_gw));
     srv.drop_db().await;
 }
+
+#[tokio::test]
+async fn roles_and_moderation() {
+    use feather_protocol::perms::*;
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await; // владелец
+    let bob = srv.signup("bob").await; // станет модератором
+    let carol = srv.signup("carol").await; // обычный участник
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "R".into() }).await;
+    let g = g.unwrap();
+    let gid = g.guild.id;
+    let text = g.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&alice.token), &CreateInviteRequest::default()).await;
+    let code = inv.unwrap().code;
+    for t in [&bob.token, &carol.token] {
+        srv.post::<_, Guild>(&format!("/invites/{code}"), Some(t), &()).await;
+    }
+
+    // Обычный участник: приглашать может (@everyone), каналы создавать — нет
+    let ch = CreateChannelRequest { name: "мод".into(), kind: ChannelKind::Text, parent_id: None };
+    assert_eq!(srv.post::<_, ApiError>(&format!("/guilds/{gid}/channels"), Some(&bob.token), &ch).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&bob.token), &CreateInviteRequest::default()).await.0, StatusCode::CREATED);
+
+    // Роль «Модератор» и выдача её Bob
+    let (mut carol_gw, _) = GatewayClient::connect(srv.addr, &carol.token).await;
+    let mod_req = RoleRequest { name: Some("Модератор".into()), color: Some(0x3ba55c), permissions: Some(KICK_MEMBERS | MANAGE_MESSAGES | MANAGE_CHANNELS), position: None };
+    let (st, role) = srv.post::<_, Role>(&format!("/guilds/{gid}/roles"), Some(&alice.token), &mod_req).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let role = role.unwrap();
+    assert!(role.position >= 1);
+    let (st, _) = srv.req::<(), ()>(reqwest::Method::PUT, &format!("/guilds/{gid}/members/{}/roles/{}", bob.user.id, role.id), Some(&alice.token), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, members) = srv.get::<Vec<GuildMember>>(&format!("/guilds/{gid}/members"), &alice.token).await;
+    let members = members.unwrap();
+    assert_eq!(members.iter().find(|m| m.user.id == bob.user.id).unwrap().roles, vec![role.id]);
+
+    // Модератор: создаёт каналы и удаляет чужие сообщения
+    assert_eq!(srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&bob.token), &ch).await.0, StatusCode::CREATED);
+    let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&carol.token), &SendMessageRequest { content: "флуд".into(), reply_to_id: None, nonce: None }).await;
+    let (st, _) = srv.req::<(), ApiError>(reqwest::Method::DELETE, &format!("/channels/{text}/messages/{}", m.unwrap().id), Some(&bob.token), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // Выдать права, которых нет самому, нельзя; управлять ролями без права — тоже
+    let admin_req = RoleRequest { name: Some("админ".into()), permissions: Some(ADMINISTRATOR), ..Default::default() };
+    assert_eq!(srv.post::<_, ApiError>(&format!("/guilds/{gid}/roles"), Some(&bob.token), &admin_req).await.0, StatusCode::FORBIDDEN);
+    let upd = RoleRequest { permissions: Some(KICK_MEMBERS | MANAGE_MESSAGES | MANAGE_CHANNELS | MANAGE_ROLES), ..Default::default() };
+    srv.req::<_, Role>(reqwest::Method::PATCH, &format!("/guilds/{gid}/roles/{}", role.id), Some(&alice.token), Some(&upd)).await;
+    let (st, err) = srv.post::<_, ApiError>(&format!("/guilds/{gid}/roles"), Some(&bob.token), &admin_req).await;
+    assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "perms_escalation"));
+
+    // Кик: модератор выгоняет Carol, у неё сервер пропадает; владельца выгнать нельзя
+    let (st, _) = srv.req::<(), ApiError>(reqwest::Method::DELETE, &format!("/guilds/{gid}/members/{}", alice.user.id), Some(&bob.token), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/guilds/{gid}/members/{}", carol.user.id), Some(&bob.token), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    loop {
+        match carol_gw.next_event().await {
+            Event::GuildDelete { guild_id } => {
+                assert_eq!(guild_id, gid);
+                break;
+            }
+            _ => continue, // роли, участники — пропускаем
+        }
+    }
+    assert_eq!(srv.get::<Vec<Message>>(&format!("/channels/{text}/messages"), &carol.token).await.0, StatusCode::NOT_FOUND);
+
+    // Бан: вернуться по приглашению нельзя
+    let (st, _) = srv.req::<(), ()>(reqwest::Method::PUT, &format!("/guilds/{gid}/bans/{}", carol.user.id), Some(&alice.token), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(srv.post::<_, ApiError>(&format!("/invites/{code}"), Some(&carol.token), &()).await.0, StatusCode::FORBIDDEN);
+
+    // Без SEND_MESSAGES у @everyone писать нельзя (403), а модератору с ролью — тоже нельзя:
+    // у роли «Модератор» этого права нет, а @everyone его больше не даёт
+    let everyone = RoleRequest { permissions: Some(CREATE_INVITE | VOICE_CONNECT), ..Default::default() };
+    srv.req::<_, Role>(reqwest::Method::PATCH, &format!("/guilds/{gid}/roles/{gid}"), Some(&alice.token), Some(&everyone)).await;
+    let msg = SendMessageRequest { content: "можно?".into(), reply_to_id: None, nonce: None };
+    assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&bob.token), &msg).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await.0, StatusCode::CREATED, "владелец может всё");
+
+    // Выход с сервера сам: можно (кроме владельца)
+    let (st, _) = srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/guilds/{gid}/members/{}", bob.user.id), Some(&bob.token), None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = srv.req::<(), ApiError>(reqwest::Method::DELETE, &format!("/guilds/{gid}/members/{}", alice.user.id), Some(&alice.token), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    drop(carol_gw);
+    srv.drop_db().await;
+}

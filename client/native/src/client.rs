@@ -10,13 +10,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, Notifier, VoiceEvent, VoiceOptions, VoiceSession};
-use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, Message, Snowflake, User, VoiceState};
+use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, Snowflake, User, VoiceState, perms};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::session::{self, Session};
 use crate::settings::{self, Settings};
-use crate::util::{initial, time_label, user_color};
+use crate::util::{color, initial, time_label, user_color};
 use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, VoiceMember};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
@@ -160,6 +160,7 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_add_channel(|i| post(move |app| app.ask_add_channel(i as usize)));
     ui.on_select_home(|| post(|app| app.select_home(None)));
     ui.on_message_member(|i| post(move |app| app.message_member(i as usize)));
+    ui.on_kick_member(|i| post(move |app| app.ask_kick(i as usize)));
 
     let weak = ui.as_weak();
     ui.on_create_guild_dialog(move || open_dialog(&weak, "create"));
@@ -276,8 +277,13 @@ struct App {
     /// Режим «Личные сообщения» и список диалогов
     dm_mode: bool,
     dms: Vec<DmChannel>,
-    /// Участники в том порядке, в каком показаны (для кнопки «Написать»)
+    /// Участники в том порядке, в каком показаны (для кнопок «Написать», «Выгнать»)
     members_view: Vec<User>,
+    /// Роли открытого сервера и роли участников
+    roles: Vec<Role>,
+    member_roles: HashMap<Snowflake, Vec<Snowflake>>,
+    /// Кого собираемся выгнать (ждём подтверждения)
+    pending_kick: Option<Snowflake>,
     channel: Option<Snowflake>,
     members: Vec<User>,
     /// Сообщения открытого канала, от старых к новым
@@ -341,6 +347,9 @@ impl App {
             dm_mode: false,
             dms: Vec::new(),
             members_view: Vec::new(),
+            roles: Vec::new(),
+            member_roles: HashMap::new(),
+            pending_kick: None,
             channel: None,
             members: Vec::new(),
             messages: Vec::new(),
@@ -418,6 +427,7 @@ impl App {
         };
         ui.set_guild_name(name.into());
         ui.set_in_dm(self.dm_mode);
+        ui.set_can_invite(self.can(perms::CREATE_INVITE));
         ui.set_home_unread(self.unread.values().any(|g| g.is_none()));
     }
 
@@ -438,7 +448,7 @@ impl App {
                 unread: self.unread.contains_key(&c.id),
                 voice_members: self.voice_members(c.id),
                 // Создавать каналы пока может владелец сервера (роли — следующий шаг)
-                can_add: c.kind == Kind::Category && self.moderator(),
+                can_add: c.kind == Kind::Category && self.can(perms::MANAGE_CHANNELS),
             })
             .collect();
         ui.set_channels(ModelRc::new(VecModel::from(items)));
@@ -495,17 +505,28 @@ impl App {
         self.refresh_channels();
     }
 
+    /// Роли сменились: перерисовать всё, что от них зависит (цвета, кнопки, права)
+    fn after_roles_changed(&mut self) {
+        self.refresh_guilds();
+        self.refresh_channels();
+        self.refresh_members();
+        self.rebuild_messages();
+    }
+
     fn refresh_members(&mut self) {
         let Some(ui) = self.ui() else { return };
         let mut ms: Vec<User> = self.members.clone();
-        ms.sort_by_key(|u| u.username.to_lowercase());
+        // Старшие роли выше, внутри — по имени
+        ms.sort_by_key(|u| (std::cmp::Reverse(self.top_position(u.id)), u.username.to_lowercase()));
+        let (can_kick, my_top) = (self.can(perms::KICK_MEMBERS), self.top_position(self.me.id));
         let items: Vec<Member> = ms
             .iter()
             .map(|u| Member {
                 name: u.username.as_str().into(),
                 initial: initial(&u.username),
-                tint: user_color(u.id),
+                tint: self.user_tint(u.id),
                 can_message: u.id != self.me.id,
+                can_kick: can_kick && u.id != self.me.id && my_top > self.top_position(u.id),
             })
             .collect();
         self.members_view = ms;
@@ -588,15 +609,47 @@ impl App {
         });
     }
 
-    /// Я владелец открытого сервера — могу удалять чужие сообщения
+    /// Мои права на открытом сервере (в личке — никаких «серверных» прав)
+    fn my_perms(&self) -> u64 {
+        let Some(g) = self.guild.and_then(|g| self.guilds.iter().find(|x| x.id == g)) else { return 0 };
+        let mine = self.member_roles.get(&self.me.id);
+        let role_perms = self.roles.iter().filter(|r| r.id == g.id || mine.is_some_and(|m| m.contains(&r.id))).map(|r| r.permissions);
+        perms::resolve(g.owner_id == self.me.id, role_perms)
+    }
+
+    fn can(&self, p: u64) -> bool {
+        self.my_perms() & p == p
+    }
+
+    /// Могу удалять чужие сообщения
     fn moderator(&self) -> bool {
-        self.guild.and_then(|g| self.guilds.iter().find(|x| x.id == g)).is_some_and(|g| g.owner_id == self.me.id)
+        self.can(perms::MANAGE_MESSAGES)
+    }
+
+    /// Позиция высшей роли (владелец — выше всех)
+    fn top_position(&self, user: Snowflake) -> i32 {
+        if self.guild.and_then(|g| self.guilds.iter().find(|x| x.id == g)).is_some_and(|g| g.owner_id == user) {
+            return i32::MAX;
+        }
+        let ids = self.member_roles.get(&user);
+        self.roles.iter().filter(|r| ids.is_some_and(|i| i.contains(&r.id))).map(|r| r.position).max().unwrap_or(0)
+    }
+
+    /// Цвет имени: цвет высшей цветной роли, иначе цвет по ID
+    fn user_tint(&self, user: Snowflake) -> slint::Color {
+        let ids = self.member_roles.get(&user);
+        self.roles
+            .iter()
+            .filter(|r| r.color != 0 && ids.is_some_and(|i| i.contains(&r.id)))
+            .max_by_key(|r| r.position)
+            .map_or_else(|| user_color(user), |r| color(r.color))
     }
 
     fn row_at(&self, i: usize) -> Msg {
         let m = &self.messages[i];
         Msg {
             mention: m.author.id != self.me.id && mentions(&m.content, &self.me.username),
+            tint: self.user_tint(m.author.id),
             ..msg_row(i.checked_sub(1).map(|p| &self.messages[p]), m, self.me.id, self.moderator())
         }
     }
@@ -656,15 +709,18 @@ impl App {
         self.load_gen += 1;
         let (api, generation) = (self.api.clone(), self.load_gen);
         self.rt.spawn(async move {
-            let res = tokio::try_join!(api.channels(id), api.members(id));
+            let res = tokio::try_join!(api.channels(id), api.members(id), api.roles(id));
             post(move |app| {
                 if app.load_gen != generation {
                     return;
                 }
                 match res {
-                    Ok((channels, members)) => {
+                    Ok((channels, members, roles)) => {
                         app.channels = ordered(channels);
-                        app.members = members;
+                        app.roles = roles;
+                        app.member_roles = members.iter().map(|m| (m.user.id, m.roles.clone())).collect();
+                        app.members = members.into_iter().map(|m: GuildMember| m.user).collect();
+                        app.refresh_guilds();
                         app.refresh_members();
                         // Открываем последний канал, где был пользователь, иначе первый текстовый
                         let remembered = session::load()
@@ -863,6 +919,15 @@ impl App {
             let voice_cat = self.channels.iter().any(|c| c.parent_id == Some(cat.id) && c.kind == Kind::Voice);
             ui.set_dialog_switch(voice_cat);
             ui.set_dialog("channel".into());
+        }
+    }
+
+    fn ask_kick(&mut self, i: usize) {
+        let Some(u) = self.members_view.get(i).cloned() else { return };
+        self.pending_kick = Some(u.id);
+        if let Some(ui) = self.ui() {
+            ui.set_dialog_value(u.username.as_str().into());
+            ui.set_dialog("kick".into());
         }
     }
 
@@ -1112,8 +1177,56 @@ impl App {
             }
             Event::GuildMemberAdd { guild_id, user } => {
                 if Some(guild_id) == self.guild && !self.members.iter().any(|u| u.id == user.id) {
+                    self.member_roles.insert(user.id, Vec::new());
                     self.members.push(user);
                     self.refresh_members();
+                }
+            }
+            Event::GuildDelete { guild_id } => {
+                // Меня выгнали (или забанили)
+                self.guilds.retain(|g| g.id != guild_id);
+                self.unread.retain(|_, g| *g != Some(guild_id));
+                if self.guild == Some(guild_id) {
+                    self.guild = None;
+                    if self.voice.as_ref().is_some_and(|v| self.channels.iter().any(|c| c.id == v.channel)) {
+                        self.leave_voice();
+                    }
+                    match self.guilds.first().map(|g| g.id) {
+                        Some(g) => self.select_guild(g),
+                        None => self.select_home(None),
+                    }
+                    self.set_status("Вас удалили с сервера");
+                } else {
+                    self.refresh_guilds();
+                }
+            }
+            Event::GuildMemberRemove { guild_id, user_id } => {
+                if Some(guild_id) == self.guild {
+                    self.members.retain(|u| u.id != user_id);
+                    self.member_roles.remove(&user_id);
+                    self.refresh_members();
+                }
+            }
+            Event::GuildMemberUpdate { guild_id, user_id, roles } => {
+                if Some(guild_id) == self.guild {
+                    self.member_roles.insert(user_id, roles);
+                    self.after_roles_changed();
+                }
+            }
+            Event::RoleCreate(r) | Event::RoleUpdate(r) => {
+                if Some(r.guild_id) == self.guild {
+                    self.roles.retain(|x| x.id != r.id);
+                    self.roles.push(r);
+                    self.after_roles_changed();
+                }
+            }
+            Event::RoleDelete { guild_id, role_id } => {
+                if Some(guild_id) == self.guild {
+                    self.roles.retain(|x| x.id != role_id);
+                    for rs in self.member_roles.values_mut() {
+                        rs.retain(|r| *r != role_id);
+                    }
+                    self.after_roles_changed();
                 }
             }
             Event::DmCreate(d) => {
@@ -1378,6 +1491,17 @@ impl App {
         if kind == "delete" {
             ui.set_dialog(SharedString::new());
             self.delete_confirmed();
+            return;
+        }
+        if kind == "kick" {
+            ui.set_dialog(SharedString::new());
+            let (Some(guild), Some(user)) = (self.guild, self.pending_kick.take()) else { return };
+            let api = self.api.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = api.kick(guild, user).await {
+                    post(move |app| app.set_status(format!("Не удалось выгнать: {e}")));
+                }
+            });
             return;
         }
         if kind == "channel" {

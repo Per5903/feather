@@ -8,12 +8,13 @@ use axum::http::StatusCode;
 use axum::Json;
 use feather_protocol::{
     Channel, ChannelKind, CreateChannelRequest, CreateGuildRequest, CreateInviteRequest, Event, Guild,
-    GuildWithChannels, Invite, Snowflake, User,
+    GuildWithChannels, Invite, Snowflake, perms,
 };
 use sqlx::PgPool;
 
 use crate::Shared;
-use crate::auth::{AuthUser, UserRow, user_from_row};
+use crate::auth::AuthUser;
+use crate::roles::{create_everyone, is_banned, member_perms};
 use crate::bus::Target;
 use crate::error::{ApiResult, AppError};
 
@@ -130,6 +131,7 @@ pub async fn create_guild(
         .bind(user.id().0 as i64)
         .execute(&mut *tx)
         .await?;
+    create_everyone(&mut tx, guild.id).await?;
     let mut channels = Vec::with_capacity(defaults.len());
     for (id, kind, name, parent, position) in defaults {
         sqlx::query("INSERT INTO channels (id, guild_id, kind, name, parent_id, position) VALUES ($1, $2, $3, $4, $5, $6)")
@@ -179,10 +181,7 @@ pub async fn create_channel(
     Path(guild_id): Path<Snowflake>,
     Json(req): Json<CreateChannelRequest>,
 ) -> ApiResult<(StatusCode, Json<Channel>)> {
-    let owner = require_member(&st.db, guild_id, user.id()).await?;
-    if owner != user.id() {
-        return Err(AppError::Forbidden);
-    }
+    member_perms(&st.db, guild_id, user.id()).await?.require(perms::MANAGE_CHANNELS)?;
     let name = validate_name(&req.name, "название канала")?;
     if req.kind == ChannelKind::Dm {
         return Err(AppError::BadRequest("bad_kind", "личный канал создаётся через /users/@me/channels".into()));
@@ -216,18 +215,6 @@ pub async fn create_channel(
     Ok((StatusCode::CREATED, Json(channel)))
 }
 
-pub async fn list_members(State(st): State<Shared>, user: AuthUser, Path(id): Path<Snowflake>) -> ApiResult<Json<Vec<User>>> {
-    require_member(&st.db, id, user.id()).await?;
-    let rows: Vec<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name FROM guild_members m JOIN users u ON u.id = m.user_id
-         WHERE m.guild_id = $1 ORDER BY lower(u.username)",
-    )
-    .bind(id.0 as i64)
-    .fetch_all(&st.db)
-    .await?;
-    Ok(Json(rows.into_iter().map(user_from_row).collect()))
-}
-
 /// Код приглашения: 8 символов без похожих (0/O, 1/l/I)
 fn invite_code() -> String {
     const ALPHABET: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -242,7 +229,7 @@ pub async fn create_invite(
     Path(guild_id): Path<Snowflake>,
     body: Option<Json<CreateInviteRequest>>,
 ) -> ApiResult<(StatusCode, Json<Invite>)> {
-    require_member(&st.db, guild_id, user.id()).await?;
+    member_perms(&st.db, guild_id, user.id()).await?.require(perms::CREATE_INVITE)?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
     if req.max_uses.is_some_and(|m| m < 1) || req.ttl_secs.is_some_and(|t| t < 60) {
         return Err(AppError::BadRequest("bad_invite", "max_uses ≥ 1, ttl_secs ≥ 60".into()));
@@ -274,6 +261,9 @@ pub async fn accept_invite(State(st): State<Shared>, user: AuthUser, Path(code):
     .fetch_optional(&mut *tx)
     .await?;
     let (guild_id,) = row.ok_or(AppError::NotFound("приглашение"))?;
+    if is_banned(&st.db, guild_id, user.id()).await? {
+        return Err(AppError::Forbidden);
+    }
     let inserted = sqlx::query("INSERT INTO guild_members (guild_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
         .bind(guild_id)
         .bind(user.id().0 as i64)

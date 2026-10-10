@@ -1,7 +1,7 @@
 //! Доступ к каналу: гильдейскому (участник сервера) или личному (собеседник).
 //! Сообщения, отметки о прочтении и «печатает» работают одинаково для обоих видов.
 
-use feather_protocol::{Channel, ChannelKind, Event, Snowflake};
+use feather_protocol::{Channel, ChannelKind, Event, Snowflake, perms};
 use sqlx::PgPool;
 
 use crate::bus::{Bus, Target};
@@ -9,22 +9,27 @@ use crate::error::{ApiResult, AppError};
 use crate::guilds::channel_from_row;
 
 pub enum Access {
-    Guild { channel: Channel, owner: Snowflake },
+    Guild { channel: Channel, perms: crate::roles::Perms },
     Dm { recipients: Vec<Snowflake> },
 }
 
 impl Access {
-    /// Можно писать сообщения: текстовый канал сервера или личный
-    pub fn can_write(&self) -> bool {
+    /// В канал вообще пишут сообщения: текстовый канал сервера или личный
+    pub fn is_textual(&self) -> bool {
         match self {
             Access::Guild { channel, .. } => channel.kind == ChannelKind::Text,
             Access::Dm { .. } => true,
         }
     }
 
-    /// Может удалять чужие сообщения: владелец сервера. В личных — никто
-    pub fn is_moderator(&self, user: Snowflake) -> bool {
-        matches!(self, Access::Guild { owner, .. } if *owner == user)
+    /// Мне можно писать: канал текстовый и есть право SEND_MESSAGES
+    pub fn can_write(&self) -> bool {
+        self.is_textual() && !matches!(self, Access::Guild { perms, .. } if !perms.has(perms::SEND_MESSAGES))
+    }
+
+    /// Может удалять чужие сообщения: право MANAGE_MESSAGES. В личных — никто
+    pub fn is_moderator(&self) -> bool {
+        matches!(self, Access::Guild { perms, .. } if perms.has(perms::MANAGE_MESSAGES))
     }
 
     /// Разослать событие тем, кто видит канал
@@ -59,9 +64,9 @@ pub async fn channel_access(db: &PgPool, channel_id: Snowflake, user: Snowflake)
     .await?;
     let (id, guild_id, kind, name, parent, position, owner) = row.ok_or(AppError::NotFound("канал"))?;
     match (guild_id, owner) {
-        (Some(g), Some(o)) => Ok(Access::Guild {
+        (Some(g), Some(_)) => Ok(Access::Guild {
+            perms: crate::roles::member_perms(db, Snowflake(g as u64), user).await?,
             channel: channel_from_row((id, g, kind, name, parent, position)),
-            owner: Snowflake(o as u64),
         }),
         _ => {
             let recipients: Vec<(i64,)> = sqlx::query_as("SELECT user_id FROM channel_recipients WHERE channel_id = $1")

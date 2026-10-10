@@ -203,7 +203,7 @@ impl Session {
                 },
                 env = bus.recv() => match env {
                     Ok(env) => {
-                        if let Some(event) = route(&env, me, &mut member_of, &subscribed, background) {
+                        if let Some(event) = route(&env, me, &mut member_of, &mut subscribed, background) {
                             s.dispatch(event).await?;
                         }
                     }
@@ -228,7 +228,7 @@ fn route(
     env: &Envelope,
     me: Snowflake,
     member_of: &mut HashSet<Snowflake>,
-    subscribed: &HashSet<Snowflake>,
+    subscribed: &mut HashSet<Snowflake>,
     background: bool,
 ) -> Option<Event> {
     let (target, event) = env.as_ref();
@@ -240,8 +240,16 @@ fn route(
     }
     match *target {
         Target::User(uid) if uid == me => {
-            if let Event::GuildCreate(g) = event {
-                member_of.insert(g.id);
+            match event {
+                Event::GuildCreate(g) => {
+                    member_of.insert(g.id);
+                }
+                // Выгнали: больше никаких событий этого сервера
+                Event::GuildDelete { guild_id } => {
+                    member_of.remove(guild_id);
+                    subscribed.remove(guild_id);
+                }
+                _ => {}
             }
             Some(event.clone())
         }

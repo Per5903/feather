@@ -73,6 +73,60 @@ pub struct Guild {
     pub owner_id: Snowflake,
 }
 
+/// Права ролей (битовая маска). Владелец сервера и ADMINISTRATOR могут всё.
+pub mod perms {
+    pub const ADMINISTRATOR: u64 = 1 << 0;
+    pub const MANAGE_GUILD: u64 = 1 << 1;
+    pub const MANAGE_CHANNELS: u64 = 1 << 2;
+    pub const MANAGE_ROLES: u64 = 1 << 3;
+    pub const KICK_MEMBERS: u64 = 1 << 4;
+    pub const BAN_MEMBERS: u64 = 1 << 5;
+    pub const CREATE_INVITE: u64 = 1 << 6;
+    pub const SEND_MESSAGES: u64 = 1 << 7;
+    pub const MANAGE_MESSAGES: u64 = 1 << 8;
+    pub const VOICE_CONNECT: u64 = 1 << 9;
+    pub const VOICE_SPEAK: u64 = 1 << 10;
+    pub const ALL: u64 = (1 << 11) - 1;
+    /// Права @everyone в новом сервере
+    pub const DEFAULT_EVERYONE: u64 = CREATE_INVITE | SEND_MESSAGES | VOICE_CONNECT | VOICE_SPEAK;
+
+    /// Итоговые права: объединение ролей; администратор — всё
+    pub fn resolve(owner: bool, role_perms: impl IntoIterator<Item = u64>) -> u64 {
+        if owner {
+            return ALL;
+        }
+        let p = role_perms.into_iter().fold(0, |a, b| a | b);
+        if p & ADMINISTRATOR != 0 { ALL } else { p }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Role {
+    pub id: Snowflake,
+    pub guild_id: Snowflake,
+    pub name: String,
+    /// 0xRRGGBB, 0 — без цвета
+    pub color: u32,
+    pub permissions: u64,
+    /// Выше — главнее; @everyone всегда 0
+    pub position: i32,
+}
+
+/// Участник сервера с ролями (@everyone не перечисляется — она есть у всех)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GuildMember {
+    pub user: User,
+    pub roles: Vec<Snowflake>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RoleRequest {
+    pub name: Option<String>,
+    pub color: Option<u32>,
+    pub permissions: Option<u64>,
+    pub position: Option<i32>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
@@ -282,6 +336,15 @@ pub enum Event {
     MessageDelete { id: Snowflake, channel_id: Snowflake },
     ChannelCreate(Channel),
     GuildMemberAdd { guild_id: Snowflake, user: User },
+    /// Участника выгнали/забанили или он ушёл
+    GuildMemberRemove { guild_id: Snowflake, user_id: Snowflake },
+    /// Сменились роли участника
+    GuildMemberUpdate { guild_id: Snowflake, user_id: Snowflake, roles: Vec<Snowflake> },
+    /// Меня выгнали (или сервер удалён) — убрать его из списка
+    GuildDelete { guild_id: Snowflake },
+    RoleCreate(Role),
+    RoleUpdate(Role),
+    RoleDelete { guild_id: Snowflake, role_id: Snowflake },
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
     /// Новый личный канал (со мной написали впервые)
@@ -299,7 +362,7 @@ pub enum Event {
 impl Event {
     /// Полное событие или «лёгкое» (для серверов без подписки)
     pub fn is_heavy(&self) -> bool {
-        !matches!(self, Event::GuildCreate(_) | Event::DmCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
+        !matches!(self, Event::GuildCreate(_) | Event::GuildDelete { .. } | Event::DmCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
     }
 }
 
@@ -314,6 +377,14 @@ mod tests {
         let packed = rmp_serde::to_vec(&id).unwrap();
         assert_eq!(rmp_serde::from_slice::<Snowflake>(&packed).unwrap(), id);
         assert!(packed.len() <= 9);
+    }
+
+    #[test]
+    fn permissions_resolve() {
+        use perms::*;
+        assert_eq!(resolve(true, []), ALL, "владелец может всё");
+        assert_eq!(resolve(false, [SEND_MESSAGES, KICK_MEMBERS]), SEND_MESSAGES | KICK_MEMBERS);
+        assert_eq!(resolve(false, [ADMINISTRATOR]), ALL);
     }
 
     #[test]

@@ -137,8 +137,17 @@ impl Api {
         self.call(Method::POST, &format!("/guilds/{guild}/channels"), Some(&req)).await
     }
 
-    pub async fn members(&self, guild: Snowflake) -> Result<Vec<User>> {
+    pub async fn members(&self, guild: Snowflake) -> Result<Vec<GuildMember>> {
         self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/members"), None).await
+    }
+
+    pub async fn roles(&self, guild: Snowflake) -> Result<Vec<Role>> {
+        self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/roles"), None).await
+    }
+
+    /// Выгнать участника (или выйти самому, если это я)
+    pub async fn kick(&self, guild: Snowflake, user: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/guilds/{guild}/members/{user}"), None).await
     }
 
     pub async fn create_invite(&self, guild: Snowflake) -> Result<Invite> {

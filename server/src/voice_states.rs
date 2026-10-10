@@ -44,6 +44,16 @@ impl VoiceStates {
         }
     }
 
+    /// Убрать пользователя из голоса на сервере (его выгнали)
+    pub fn remove_in_guild(&self, user: Snowflake, guild: Snowflake) -> Option<VoiceState> {
+        let mut map = self.by_user.lock().unwrap();
+        if map.get(&user).is_some_and(|e| e.state.guild_id == guild) {
+            map.remove(&user).map(|e| VoiceState { channel_id: None, ..e.state })
+        } else {
+            None
+        }
+    }
+
     pub fn current_guild(&self, user: Snowflake) -> Option<Snowflake> {
         self.by_user.lock().unwrap().get(&user).map(|e| e.state.guild_id)
     }

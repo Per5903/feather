@@ -87,6 +87,9 @@ pub async fn send(
 ) -> ApiResult<(StatusCode, Json<Message>)> {
     st.limiter.check(&format!("msg:{}", user.id()), ratelimit::MESSAGES).map_err(AppError::rate_limited)?;
     let access = channel_access(&st.db, channel_id, user.id()).await?;
+    if access.is_textual() && !access.can_write() {
+        return Err(AppError::Forbidden);
+    }
     if !access.can_write() {
         return Err(AppError::BadRequest("not_text_channel", "писать можно только в текстовый канал".into()));
     }
@@ -152,7 +155,7 @@ pub async fn delete(
     let access = channel_access(&st.db, channel_id, user.id()).await?;
     let message = load(&st.db, channel_id, message_id).await?;
     // Удалить может автор или владелец сервера (модерация)
-    if message.author.id != user.id() && !access.is_moderator(user.id()) {
+    if message.author.id != user.id() && !access.is_moderator() {
         return Err(AppError::Forbidden);
     }
     sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id.0 as i64).execute(&st.db).await?;
