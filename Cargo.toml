@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["client/desktop", "client/native", "client/voice-proto"]
+members = ["client/desktop", "client/native", "client/voice-proto", "client/ptt-proto"]
 
 # Релизная сборка оптимизирована по размеру: клиент должен быть лёгким
 [profile.release]

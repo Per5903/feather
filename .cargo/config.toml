@@ -1,0 +1,4 @@
+# Где искать CUDA для аппаратного кодировщика NVENC в webrtc-sys (Arch: /opt/cuda).
+# Переменная окружения CUDA_HOME, если задана, имеет приоритет.
+[env]
+CUDA_HOME = { value = "/opt/cuda", force = false }

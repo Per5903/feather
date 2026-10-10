@@ -12,6 +12,10 @@
 //!                  FEATHER_NO_APM=1 просит выключить обработку, но в SDK 0.9.4 на десктопе
 //!                  это выключает только аппаратную; программная (шумодав и т.д.) остаётся.
 //!   record <файл.wav> <секунд> — пишет первый услышанный голос в файл (оценка шумодава).
+//!   video <ширина> <высота> <fps> <кодек> — синтетическая «демонстрация экрана»
+//!                  (кодек: h264 | vp8 | av1). Аппаратный кодировщик выбирается переменной
+//!                  LIVEKIT_PREFERRED_HW_ENCODER=nvenc|vaapi (сборка: CUDA_HOME, libva).
+//!   viewer       — смотрит видео и печатает реальный fps.
 //!
 //! Виртуальные устройства и тестовая речь: bench/audio/ (vdev.sh, make_noisy.py).
 
@@ -311,6 +315,94 @@ fn write_wav(path: &str, data: &[i16]) -> std::io::Result<()> {
     f.flush()
 }
 
+async fn video_mode(width: u32, height: u32, fps: u32, codec: &str) {
+    use livekit::options::{VideoCodec, VideoEncoding};
+    use livekit::webrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
+    use livekit::webrtc::video_source::native::NativeVideoSource;
+    use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
+
+    // Кадры генерируются заранее и крутятся по кругу, чтобы замер был про кодирование,
+    // а не про рисование. Каждый кадр отличается: сдвинутый градиент и движущийся блок.
+    const FRAMES: usize = 12;
+    let mut frames: Vec<VideoFrame<I420Buffer>> = (0..FRAMES)
+        .map(|i| {
+            let mut buf = I420Buffer::new(width, height);
+            let (sy, su, sv) = buf.strides();
+            let (y, u, v) = buf.data_mut();
+            let shift = i * 7;
+            for row in 0..height as usize {
+                for col in 0..width as usize {
+                    let in_box = (col / 64 + i) % 8 == 0 && (row / 64) % 4 == 1;
+                    y[row * sy as usize + col] = if in_box { 235 } else { ((col + row + shift) % 220) as u8 + 16 };
+                }
+            }
+            for row in 0..(height as usize).div_ceil(2) {
+                for col in 0..(width as usize).div_ceil(2) {
+                    u[row * su as usize + col] = ((col + shift) % 200) as u8 + 28;
+                    v[row * sv as usize + col] = ((row + shift) % 200) as u8 + 28;
+                }
+            }
+            VideoFrame::new(VideoRotation::VideoRotation0, buf)
+        })
+        .collect();
+
+    let source = NativeVideoSource::new(VideoResolution { width, height }, true);
+    let track = LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
+    let video_codec = match codec {
+        "vp8" => VideoCodec::VP8,
+        "av1" => VideoCodec::AV1,
+        _ => VideoCodec::H264,
+    };
+    let (room, _events) = join("streamer").await;
+    room.local_participant()
+        .publish_track(
+            LocalTrack::Video(track),
+            TrackPublishOptions {
+                source: TrackSource::Screenshare,
+                video_codec,
+                simulcast: false,
+                video_encoding: Some(VideoEncoding { max_bitrate: 6_000_000, max_framerate: fps as f64 }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("не удалось опубликовать видео");
+    println!("транслирую {width}x{height}@{fps} {codec}");
+
+    let start = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_micros(1_000_000 / fps as u64));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut n = 0usize;
+    loop {
+        tick.tick().await;
+        let frame = &mut frames[n % FRAMES];
+        frame.timestamp_us = start.elapsed().as_micros() as i64;
+        source.capture_frame(frame);
+        n += 1;
+    }
+}
+
+async fn viewer_mode() {
+    use livekit::webrtc::video_stream::native::NativeVideoStream;
+    let (_room, mut events) = join("viewer").await;
+    while let Some(ev) = events.recv().await {
+        if let RoomEvent::TrackSubscribed { track: RemoteTrack::Video(t), .. } = ev {
+            tokio::spawn(async move {
+                let mut stream = NativeVideoStream::new(t.rtc_track());
+                let (mut count, mut since) = (0u32, Instant::now());
+                while let Some(frame) = stream.next().await {
+                    count += 1;
+                    if since.elapsed() >= Duration::from_secs(5) {
+                        let b = &frame.buffer;
+                        println!("вижу {}x{} @ {:.1} fps", b.width(), b.height(), count as f64 / since.elapsed().as_secs_f64());
+                        (count, since) = (0, Instant::now());
+                    }
+                }
+            });
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -323,6 +415,12 @@ async fn main() {
             let secs = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
             record_mode(path, secs).await
         }
-        _ => eprintln!("использование: feather-voice-proto latency | peer <имя> | device <имя> | record <файл> <секунд>"),
+        Some("video") => {
+            let num = |i: usize, d: u32| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+            let codec = args.get(4).cloned().unwrap_or_else(|| "h264".into());
+            video_mode(num(1, 1920), num(2, 1080), num(3, 30), &codec).await
+        }
+        Some("viewer") => viewer_mode().await,
+        _ => eprintln!("использование: feather-voice-proto latency | peer <имя> | device <имя> | record <файл> <секунд> | video <w> <h> <fps> <кодек> | viewer"),
     }
 }
