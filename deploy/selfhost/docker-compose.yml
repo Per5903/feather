@@ -34,6 +34,8 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       # Сервер за Caddy: настоящий IP клиента — в X-Forwarded-For (для лимитов частоты)
       FEATHER_TRUST_PROXY: "1"
+      # Кто может регистрироваться: open | invite (только по коду приглашения) | closed
+      FEATHER_REGISTRATION: ${FEATHER_REGISTRATION:-open}
     volumes:
       - files:/data   # вложения
     depends_on:

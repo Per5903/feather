@@ -250,6 +250,24 @@ pub async fn create_invite(
 }
 
 pub async fn accept_invite(State(st): State<Shared>, user: AuthUser, Path(code): Path<String>) -> ApiResult<Json<Guild>> {
+    Ok(Json(join_by_invite(&st, &user.0, &code).await?))
+}
+
+/// Действующее ли приглашение (для регистрации «только по приглашению»)
+pub async fn invite_is_valid(db: &PgPool, code: &str) -> ApiResult<bool> {
+    let (ok,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM invites WHERE code = $1
+                         AND (expires_at IS NULL OR expires_at > now()) AND (max_uses IS NULL OR uses < max_uses))",
+    )
+    .bind(code.trim())
+    .fetch_one(db)
+    .await?;
+    Ok(ok)
+}
+
+/// Вступить в сообщество по коду (кнопка «Войти по приглашению» и регистрация с кодом)
+pub async fn join_by_invite(st: &Shared, user: &feather_protocol::User, code: &str) -> ApiResult<Guild> {
+    let code = code.trim();
     let mut tx = st.db.begin().await?;
     // FOR UPDATE: два одновременных входа не превысят max_uses
     let row: Option<(i64,)> = sqlx::query_as(
@@ -261,12 +279,12 @@ pub async fn accept_invite(State(st): State<Shared>, user: AuthUser, Path(code):
     .fetch_optional(&mut *tx)
     .await?;
     let (guild_id,) = row.ok_or(AppError::NotFound("приглашение"))?;
-    if is_banned(&st.db, guild_id, user.id()).await? {
+    if is_banned(&st.db, guild_id, user.id).await? {
         return Err(AppError::Forbidden);
     }
     let inserted = sqlx::query("INSERT INTO guild_members (guild_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
         .bind(guild_id)
-        .bind(user.id().0 as i64)
+        .bind(user.id.0 as i64)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -282,8 +300,8 @@ pub async fn accept_invite(State(st): State<Shared>, user: AuthUser, Path(code):
 
     let guild = guild_from_row(guild);
     if inserted {
-        st.bus.publish(Target::Guild(guild.id), Event::GuildMemberAdd { guild_id: guild.id, user: user.0.clone() });
-        st.bus.publish(Target::User(user.id()), Event::GuildCreate(guild.clone()));
+        st.bus.publish(Target::Guild(guild.id), Event::GuildMemberAdd { guild_id: guild.id, user: user.clone() });
+        st.bus.publish(Target::User(user.id), Event::GuildCreate(guild.clone()));
     }
-    Ok(Json(guild))
+    Ok(guild)
 }

@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use feather_protocol::{LoginRequest, LoginResponse, RegisterRequest, Snowflake, User};
+use feather_protocol::{InstanceInfo, LoginRequest, LoginResponse, RegisterRequest, RegistrationMode, Snowflake, User};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -42,6 +42,20 @@ fn validate_username(name: &str) -> ApiResult<()> {
 
 pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<RegisterRequest>) -> ApiResult<(StatusCode, Json<User>)> {
     st.limiter.check(&format!("auth:{ip}"), ratelimit::AUTH).map_err(AppError::rate_limited)?;
+    let invite = req.invite_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    match st.cfg.registration {
+        RegistrationMode::Closed => {
+            return Err(AppError::BadRequest("registration_closed", "регистрация на этом сервере закрыта".into()));
+        }
+        RegistrationMode::Invite => match invite {
+            Some(code) if crate::guilds::invite_is_valid(&st.db, code).await? => {}
+            // Первый аккаунт на новом сервере — без кода, иначе приглашать было бы некому
+            _ if sqlx::query_as::<_, (bool,)>("SELECT NOT EXISTS (SELECT 1 FROM users)").fetch_one(&st.db).await?.0 => {}
+            Some(_) => return Err(AppError::BadRequest("bad_invite", "код приглашения недействителен или истёк".into())),
+            None => return Err(AppError::BadRequest("invite_required", "регистрация только по приглашению: введите код".into())),
+        },
+        RegistrationMode::Open => {}
+    }
     let username = req.username.trim().to_owned();
     validate_username(&username)?;
     if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&req.password.chars().count()) {
@@ -66,8 +80,23 @@ pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req
     match res {
         Err(e) if is_unique_violation(&e) => Err(AppError::Conflict("username_taken", "это имя уже занято".into())),
         Err(e) => Err(e.into()),
-        Ok(_) => Ok((StatusCode::CREATED, Json(User { id, username, display_name: None }))),
+        Ok(_) => {
+            let user = User { id, username, display_name: None };
+            // С кодом приглашения — сразу в сообщество. Не вышло (код истёк в эту секунду) —
+            // аккаунт всё равно создан, вступить можно позже
+            if let Some(code) = invite
+                && let Err(e) = crate::guilds::join_by_invite(&st, &user, code).await
+            {
+                tracing::info!("регистрация с приглашением: не вступил: {e:?}");
+            }
+            Ok((StatusCode::CREATED, Json(user)))
+        }
     }
+}
+
+/// Сведения для экрана входа: какой режим регистрации
+pub async fn instance(State(st): State<Shared>) -> Json<InstanceInfo> {
+    Json(InstanceInfo { registration: st.cfg.registration })
 }
 
 pub async fn login(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<LoginRequest>) -> ApiResult<Json<LoginResponse>> {

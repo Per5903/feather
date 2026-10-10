@@ -54,6 +54,7 @@ pub async fn build(cfg: Config) -> Result<Router, sqlx::Error> {
 
 fn router(state: Shared) -> Router {
     let api = Router::new()
+        .route("/instance", get(auth::instance))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))

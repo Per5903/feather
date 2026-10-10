@@ -197,6 +197,27 @@ pub struct Invite {
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
+    /// Код приглашения: сразу вступить в сообщество. В режиме «только по приглашению» обязателен
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_code: Option<String>,
+}
+
+/// Кто может регистрироваться на этом сервере Feather
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationMode {
+    /// Любой, кто знает адрес
+    Open,
+    /// Только с действующим кодом приглашения
+    Invite,
+    /// Регистрация выключена
+    Closed,
+}
+
+/// Сведения о сервере Feather для экрана входа (GET /api/v1/instance)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub registration: RegistrationMode,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

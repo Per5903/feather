@@ -388,10 +388,17 @@ component LoginScreen inherits Rectangle {
     in-out property <string> server-url;
     in-out property <string> username;
     in-out property <string> password;
+    in-out property <string> password2;
+    in-out property <string> invite;
+    /// false — вход, true — создание аккаунта
+    in-out property <bool> register-mode;
+    /// Подсказка о режиме регистрации на этом сервере Feather
+    in property <string> registration-hint;
     in property <string> error;
     in property <bool> busy;
     callback login();
     callback register();
+    callback mode-changed();
     background: Theme.bg0;
     Rectangle {
         width: 400px;
@@ -411,13 +418,13 @@ component LoginScreen inherits Rectangle {
                 horizontal-alignment: center;
             }
             Text {
-                text: "Вход на сервер сообщества";
+                text: register-mode ? "Создание аккаунта" : "Вход";
                 color: Theme.dim;
                 horizontal-alignment: center;
             }
             Field {
-                label: "АДРЕС СЕРВЕРА";
-                LineEdit { text <=> root.server-url; enabled: !busy; }
+                label: "АДРЕС FEATHER";
+                LineEdit { text <=> root.server-url; enabled: !busy; placeholder-text: "https://chat.example.com"; }
             }
             Field {
                 label: "ИМЯ";
@@ -429,26 +436,49 @@ component LoginScreen inherits Rectangle {
                     text <=> root.password;
                     input-type: InputType.password;
                     enabled: !busy;
-                    accepted => { root.login(); }
+                    accepted => { if (!register-mode) { root.login(); } }
                 }
+            }
+            if register-mode: Field {
+                label: "ПОВТОРИТЕ ПАРОЛЬ";
+                LineEdit { text <=> root.password2; input-type: InputType.password; enabled: !busy; }
+            }
+            if register-mode: Field {
+                label: "КОД ПРИГЛАШЕНИЯ";
+                LineEdit { text <=> root.invite; enabled: !busy; placeholder-text: "необязательно"; }
+            }
+            if register-mode && registration-hint != "": Text {
+                text: registration-hint;
+                color: Theme.dim;
+                font-size: 12px;
+                wrap: word-wrap;
             }
             if error != "": Text {
                 text: error;
                 color: Theme.danger;
                 wrap: word-wrap;
             }
+            Button {
+                text: busy ? "Подключаюсь…" : register-mode ? "Создать аккаунт" : "Войти";
+                primary: true;
+                enabled: !busy;
+                clicked => { if (register-mode) { root.register(); } else { root.login(); } }
+            }
             HorizontalLayout {
-                spacing: 8px;
-                Button {
-                    text: busy ? "Подключаюсь…" : "Войти";
-                    primary: true;
-                    enabled: !busy;
-                    clicked => { root.login(); }
-                }
-                Button {
-                    text: "Регистрация";
-                    enabled: !busy;
-                    clicked => { root.register(); }
+                alignment: center;
+                lta := TouchArea {
+                    width: link.preferred-width;
+                    height: link.preferred-height;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.register-mode = !root.register-mode;
+                        root.mode-changed();
+                    }
+                    link := Text {
+                        text: register-mode ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Зарегистрироваться";
+                        color: lta.has-hover ? Theme.text : Theme.accent;
+                        font-size: 13px;
+                    }
                 }
             }
         }
@@ -792,6 +822,11 @@ export component AppWindow inherits Window {
     in-out property <string> server-url;
     in-out property <string> login-name;
     in-out property <string> login-password;
+    in-out property <string> login-password2;
+    in-out property <string> login-invite;
+    in-out property <bool> register-mode;
+    in property <string> registration-hint;
+    callback login-mode-changed();
     in property <string> login-error;
     in property <bool> login-busy;
     callback login();
@@ -918,6 +953,11 @@ export component AppWindow inherits Window {
         server-url <=> root.server-url;
         username <=> root.login-name;
         password <=> root.login-password;
+        password2 <=> root.login-password2;
+        invite <=> root.login-invite;
+        register-mode <=> root.register-mode;
+        registration-hint: root.registration-hint;
+        mode-changed => { root.login-mode-changed(); }
         error: root.login-error;
         busy: root.login-busy;
         login => { root.login(); }
@@ -1401,15 +1441,15 @@ export component AppWindow inherits Window {
     }
 
     if dialog == "create": Dialog {
-        title: "Новый сервер";
-        hint: "Свой сервер для клана, гильдии или друзей.";
+        title: "Новое сообщество";
+        hint: "Своё сообщество для клана, гильдии или друзей: каналы, голос, роли.";
         ok-text: "Создать";
         value <=> root.dialog-value;
         ok => { root.dialog-ok(); }
         cancel => { root.dialog = ""; }
     }
     if dialog == "join": Dialog {
-        title: "Войти по приглашению";
+        title: "Вступить в сообщество";
         hint: "Вставьте код приглашения, который вам прислали.";
         ok-text: "Войти";
         value <=> root.dialog-value;

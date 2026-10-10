@@ -19,7 +19,8 @@ use crate::settings::{self, Settings};
 use crate::util::{color, initial, time_label, user_color};
 use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, PermItem, RoleItem, VoiceMember};
 
-const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+/// Пусто: адрес Feather каждому сообщает тот, кто зовёт (в поле — пример)
+const DEFAULT_SERVER: &str = "";
 const HISTORY_LIMIT: u32 = 100;
 /// Сообщения одного автора в пределах 5 минут идут одной группой без шапки
 const GROUP_GAP_MS: u64 = 5 * 60_000;
@@ -66,6 +67,37 @@ pub fn run(ui: &AppWindow, rt: Handle) {
     }
     wire_callbacks(ui);
 
+    // Переключились на регистрацию — узнаём у сервера Feather, кто может регистрироваться
+    {
+        let weak = ui.as_weak();
+        let rt = rt.clone();
+        ui.on_login_mode_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_login_error(SharedString::new());
+            ui.set_registration_hint(SharedString::new());
+            if !ui.get_register_mode() {
+                return;
+            }
+            let api = Api::new(ui.get_server_url().as_str());
+            let weak = weak.clone();
+            rt.spawn(async move {
+                let hint = match api.instance().await.map(|i| i.registration) {
+                    Ok(feather_protocol::RegistrationMode::Open) => "Код приглашения необязателен: с ним вы сразу попадёте в сообщество.",
+                    Ok(feather_protocol::RegistrationMode::Invite) => "На этом Feather регистрация только по приглашению: нужен код.",
+                    Ok(feather_protocol::RegistrationMode::Closed) => "Регистрация на этом Feather закрыта.",
+                    Err(_) => "",
+                };
+                post_ui(weak, move |ui| ui.set_registration_hint(hint.into()));
+            });
+        });
+    }
+
+    // Для снимков интерфейса в автотестах: сразу экран регистрации
+    if std::env::var_os("FEATHER_TEST_REGISTER").is_some() {
+        ui.set_register_mode(true);
+        ui.invoke_login_mode_changed();
+    }
+
     // Сохранённая сессия: входим без пароля
     if let Some(token) = saved.token {
         ui.set_login_busy(true);
@@ -92,9 +124,20 @@ pub fn run(ui: &AppWindow, rt: Handle) {
 fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
     let Some(ui) = weak.upgrade() else { return };
     let (server, name, password) = (ui.get_server_url().to_string(), ui.get_login_name().to_string(), ui.get_login_password().to_string());
+    let invite = ui.get_login_invite().trim().to_owned();
     if name.trim().is_empty() || password.is_empty() {
         ui.set_login_error("Введите имя и пароль".into());
         return;
+    }
+    if register {
+        if password != ui.get_login_password2().as_str() {
+            ui.set_login_error("Пароли не совпадают".into());
+            return;
+        }
+        if password.chars().count() < 8 {
+            ui.set_login_error("Пароль — от 8 символов".into());
+            return;
+        }
     }
     ui.set_login_busy(true);
     ui.set_login_error(SharedString::new());
@@ -103,7 +146,7 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
         let api = Api::new(&server);
         let result = async {
             if register {
-                api.register(name.trim(), &password).await?;
+                api.register(name.trim(), &password, (!invite.is_empty()).then_some(invite.as_str())).await?;
             }
             api.login(name.trim(), &password, &device_name()).await
         }
@@ -113,6 +156,9 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
             match result {
                 Ok(resp) => {
                     ui.set_login_password(SharedString::new());
+                    ui.set_login_password2(SharedString::new());
+                    ui.set_login_invite(SharedString::new());
+                    ui.set_register_mode(false);
                     let api = api.with_token(resp.token.clone());
                     let prev = session::load().filter(|s| s.server == api.base() && s.username == resp.user.username);
                     session::save(&Session {
@@ -995,7 +1041,7 @@ impl App {
                             app.refresh_channels();
                         }
                     }
-                    Err(e) => app.set_status(format!("Не удалось загрузить сервер: {e}")),
+                    Err(e) => app.set_status(format!("Не удалось загрузить сообщество: {e}")),
                 }
             });
         });
@@ -1516,7 +1562,7 @@ impl App {
                         Some(first) => self.select_guild(first),
                         None => {
                             self.refresh_guilds();
-                            self.set_status("У вас пока нет серверов: создайте свой (+) или войдите по приглашению (→)");
+                            self.set_status("Вы пока не состоите в сообществах: создайте своё (+) или вступите по приглашению (→)");
                         }
                     },
                 }
@@ -1622,7 +1668,7 @@ impl App {
                         Some(g) => self.select_guild(g),
                         None => self.select_home(None),
                     }
-                    self.set_status("Вас удалили с сервера");
+                    self.set_status("Вас удалили из сообщества");
                 } else {
                     self.refresh_guilds();
                 }

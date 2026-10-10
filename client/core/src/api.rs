@@ -93,8 +93,13 @@ impl Api {
         Err(Error::Api { status: status.as_u16(), code: err.code, message: err.message })
     }
 
-    pub async fn register(&self, username: &str, password: &str) -> Result<User> {
-        let req = RegisterRequest { username: username.into(), password: password.into() };
+    /// Режим регистрации сервера Feather (для экрана входа)
+    pub async fn instance(&self) -> Result<InstanceInfo> {
+        self.call::<(), _>(Method::GET, "/instance", None).await
+    }
+
+    pub async fn register(&self, username: &str, password: &str, invite_code: Option<&str>) -> Result<User> {
+        let req = RegisterRequest { username: username.into(), password: password.into(), invite_code: invite_code.map(Into::into) };
         self.call(Method::POST, "/auth/register", Some(&req)).await
     }
 

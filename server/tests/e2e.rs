@@ -24,6 +24,11 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// Запуск с изменёнными настройками (например, режим регистрации)
+    async fn start_with(tweak: impl FnOnce(&mut feather_server::Config)) -> Self {
         let admin_url = std::env::var("FEATHER_TEST_ADMIN_URL").unwrap_or_else(|_| ADMIN_URL.into());
         let db_name = format!(
             "feather_test_{}_{}",
@@ -35,6 +40,7 @@ impl TestServer {
         let mut cfg = feather_server::Config::from_env();
         cfg.data_dir = std::env::temp_dir().join(&db_name);
         cfg.database_url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+        tweak(&mut cfg);
         let app = feather_server::build(cfg).await.expect("сервер не собрался");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -87,7 +93,7 @@ impl TestServer {
     }
 
     async fn signup(&self, name: &str) -> LoginResponse {
-        let creds = RegisterRequest { username: name.into(), password: "correct horse battery".into() };
+        let creds = RegisterRequest { username: name.into(), password: "correct horse battery".into(), invite_code: None };
         let (st, _) = self.post::<_, User>("/auth/register", None, &creds).await;
         assert_eq!(st, StatusCode::CREATED, "регистрация {name}");
         let (st, login) = self
@@ -148,11 +154,11 @@ async fn full_flow() {
     // --- регистрация и вход
     let alice = srv.signup("Alice").await;
     let bob = srv.signup("bob").await;
-    let dup = RegisterRequest { username: "alice".into(), password: "whatever123".into() };
+    let dup = RegisterRequest { username: "alice".into(), password: "whatever123".into(), invite_code: None };
     let (st, err) = srv.post::<_, ApiError>("/auth/register", None, &dup).await;
     assert_eq!(st, StatusCode::CONFLICT, "имя занято без учёта регистра");
     assert_eq!(err.unwrap().code, "username_taken");
-    let weak = RegisterRequest { username: "carol".into(), password: "short".into() };
+    let weak = RegisterRequest { username: "carol".into(), password: "short".into(), invite_code: None };
     assert_eq!(srv.post::<_, ApiError>("/auth/register", None, &weak).await.0, StatusCode::BAD_REQUEST);
     let wrong = LoginRequest { username: "alice".into(), password: "nope-nope".into(), device_name: None };
     assert_eq!(srv.post::<_, ApiError>("/auth/login", None, &wrong).await.0, StatusCode::BAD_REQUEST);
@@ -727,5 +733,40 @@ async fn attachments() {
     // Удалили сообщение — файлов больше нет
     srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/channels/{text}/messages/{}", m.id), Some(&alice.token), None).await;
     assert_eq!(get(format!("/attachments/{}", img.id), alice.token.clone()).await.status(), StatusCode::NOT_FOUND);
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn registration_modes() {
+    let reg = |name: &str, invite: Option<String>| RegisterRequest { username: name.into(), password: "correct horse battery".into(), invite_code: invite };
+
+    // «Только по приглашению»: без кода нельзя, с чужим кодом нельзя, с действующим — можно и сразу в сообществе
+    let srv = TestServer::start_with(|c| c.registration = RegistrationMode::Invite).await;
+    // Первый аккаунт на пустом сервере — без кода (иначе приглашать было бы некому)
+    assert_eq!(srv.post::<_, User>("/auth/register", None, &reg("админ", None)).await.0, StatusCode::CREATED);
+    let (_, info) = srv.req::<(), InstanceInfo>(reqwest::Method::GET, "/instance", None, None).await;
+    assert_eq!(info.unwrap().registration, RegistrationMode::Invite);
+    let (st, err) = srv.post::<_, ApiError>("/auth/register", None, &reg("гость", None)).await;
+    assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "invite_required"));
+    assert_eq!(srv.post::<_, ApiError>("/auth/register", None, &reg("гость", Some("nope1234".into()))).await.1.unwrap().code, "bad_invite");
+    srv.drop_db().await;
+
+    // Открытый режим + код: регистрация сразу вступает в сообщество
+    let srv = TestServer::start().await;
+    let owner = srv.signup("owner").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&owner.token), &CreateGuildRequest { name: "Клан".into() }).await;
+    let gid = g.unwrap().guild.id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&owner.token), &CreateInviteRequest::default()).await;
+    let code = inv.unwrap().code;
+    assert_eq!(srv.post::<_, User>("/auth/register", None, &reg("новичок", Some(format!(" {code} ")))).await.0, StatusCode::CREATED);
+    let (_, login) = srv.post::<_, LoginResponse>("/auth/login", None, &LoginRequest { username: "новичок".into(), password: "correct horse battery".into(), device_name: None }).await;
+    let (_, guilds) = srv.get::<Vec<Guild>>("/users/@me/guilds", &login.unwrap().token).await;
+    assert_eq!(guilds.unwrap().iter().map(|g| g.id).collect::<Vec<_>>(), vec![gid], "с кодом — сразу в сообществе");
+    srv.drop_db().await;
+
+    // Закрытый режим
+    let srv = TestServer::start_with(|c| c.registration = RegistrationMode::Closed).await;
+    let (st, err) = srv.post::<_, ApiError>("/auth/register", None, &reg("кто-то", None)).await;
+    assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "registration_closed"));
     srv.drop_db().await;
 }

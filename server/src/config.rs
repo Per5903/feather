@@ -17,6 +17,8 @@ pub struct Config {
     pub trust_proxy: bool,
     /// Каталог для файлов (вложения)
     pub data_dir: std::path::PathBuf,
+    /// Регистрация: open | invite | closed (FEATHER_REGISTRATION)
+    pub registration: feather_protocol::RegistrationMode,
 }
 
 impl Config {
@@ -32,6 +34,12 @@ impl Config {
             session_ttl_days: var("FEATHER_SESSION_TTL_DAYS", "30").parse().expect("FEATHER_SESSION_TTL_DAYS: нужно число"),
             trust_proxy: var("FEATHER_TRUST_PROXY", "0") == "1",
             data_dir: var("FEATHER_DATA_DIR", "data").into(),
+            registration: match var("FEATHER_REGISTRATION", "open").as_str() {
+                "invite" => feather_protocol::RegistrationMode::Invite,
+                "closed" => feather_protocol::RegistrationMode::Closed,
+                "open" => feather_protocol::RegistrationMode::Open,
+                other => panic!("FEATHER_REGISTRATION: open | invite | closed, а не {other}"),
+            },
         }
     }
 }
