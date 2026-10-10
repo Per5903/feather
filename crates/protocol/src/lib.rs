@@ -79,6 +79,8 @@ pub enum ChannelKind {
     Text,
     Voice,
     Category,
+    /// Личные сообщения (вне серверов)
+    Dm,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -89,6 +91,14 @@ pub struct Channel {
     pub name: String,
     pub parent_id: Option<Snowflake>,
     pub position: i32,
+}
+
+/// Личный канал: собеседники (без меня) и последнее сообщение (для сортировки и непрочитанного)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DmChannel {
+    pub id: Snowflake,
+    pub recipients: Vec<User>,
+    pub last_message_id: Option<Snowflake>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -181,6 +191,11 @@ pub struct EditMessageRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CreateDmRequest {
+    pub recipient_id: Snowflake,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AckRequest {
     pub message_id: Snowflake,
 }
@@ -188,7 +203,8 @@ pub struct AckRequest {
 /// Канал, в котором есть непрочитанное (приходит в READY)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UnreadChannel {
-    pub guild_id: Snowflake,
+    /// None — личный канал
+    pub guild_id: Option<Snowflake>,
     pub channel_id: Snowflake,
     pub last_message_id: Snowflake,
 }
@@ -268,6 +284,8 @@ pub enum Event {
     GuildMemberAdd { guild_id: Snowflake, user: User },
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
+    /// Новый личный канал (со мной написали впервые)
+    DmCreate(DmChannel),
     VoiceStateUpdate(VoiceState),
     /// Кто-то начал печатать (показывать ~10 секунд или до его сообщения)
     TypingStart { channel_id: Snowflake, user: User },
@@ -281,7 +299,7 @@ pub enum Event {
 impl Event {
     /// Полное событие или «лёгкое» (для серверов без подписки)
     pub fn is_heavy(&self) -> bool {
-        !matches!(self, Event::GuildCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
+        !matches!(self, Event::GuildCreate(_) | Event::DmCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
     }
 }
 

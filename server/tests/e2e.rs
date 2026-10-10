@@ -322,7 +322,7 @@ async fn read_states() {
     let (_, ready) = GatewayClient::connect(srv.addr, &alice.token).await;
     assert!(unread_of(ready).is_empty(), "свои сообщения не непрочитанные");
     let (mut bob_gw, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
-    assert_eq!(unread_of(ready), vec![UnreadChannel { guild_id: g.guild.id, channel_id: text, last_message_id: last }]);
+    assert_eq!(unread_of(ready), vec![UnreadChannel { guild_id: Some(g.guild.id), channel_id: text, last_message_id: last }]);
 
     // Bob дочитал: его же шлюз (другие устройства) получает CHANNEL_ACK
     let (st, _) = srv.post::<_, ()>(&format!("/channels/{text}/ack"), Some(&bob.token), &AckRequest { message_id: last }).await;
@@ -486,6 +486,72 @@ async fn typing() {
     alice_gw.send(&ClientOp::Typing { channel_id: text }).await;
     bob_gw.send(&ClientOp::Heartbeat { seq: 2 }).await;
     assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck, "в игровом режиме TYPING не приходит");
+
+    drop((alice_gw, bob_gw));
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn direct_messages() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let carol = srv.signup("carol").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "D".into() }).await;
+    let g = g.unwrap();
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{}/invites", g.guild.id), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", inv.unwrap().code), Some(&bob.token), &()).await;
+
+    // Bob в шлюзе, ни на какой сервер не подписан: личные события приходят всё равно
+    let (mut bob_gw, _) = GatewayClient::connect(srv.addr, &bob.token).await;
+
+    let (st, dm) = srv.post::<_, DmChannel>("/users/@me/channels", Some(&alice.token), &CreateDmRequest { recipient_id: bob.user.id }).await;
+    assert_eq!(st, StatusCode::OK);
+    let dm = dm.unwrap();
+    assert_eq!(dm.recipients.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), vec!["bob"]);
+    match bob_gw.next_event().await {
+        Event::DmCreate(d) => {
+            assert_eq!(d.id, dm.id);
+            assert_eq!(d.recipients[0].username, "alice", "Bob видит собеседника, а не себя");
+        }
+        other => panic!("ожидался DM_CREATE, пришло {other:?}"),
+    }
+    // Повторное открытие — тот же канал, без нового события
+    let (_, again) = srv.post::<_, DmChannel>("/users/@me/channels", Some(&alice.token), &CreateDmRequest { recipient_id: bob.user.id }).await;
+    assert_eq!(again.unwrap().id, dm.id);
+
+    // Писать незнакомым (нет общего сервера) и самому себе нельзя
+    let to_carol = CreateDmRequest { recipient_id: carol.user.id };
+    assert_eq!(srv.post::<_, ApiError>("/users/@me/channels", Some(&alice.token), &to_carol).await.0, StatusCode::NOT_FOUND);
+    let to_self = CreateDmRequest { recipient_id: alice.user.id };
+    assert_eq!(srv.post::<_, ApiError>("/users/@me/channels", Some(&alice.token), &to_self).await.0, StatusCode::BAD_REQUEST);
+
+    // Сообщение и «печатает» в личке доходят до Bob
+    let (mut alice_gw, _) = GatewayClient::connect(srv.addr, &alice.token).await;
+    alice_gw.send(&ClientOp::Typing { channel_id: dm.id }).await;
+    assert!(matches!(bob_gw.next_event().await, Event::TypingStart { channel_id, .. } if channel_id == dm.id));
+    let send = SendMessageRequest { content: "привет в личку".into(), reply_to_id: None, nonce: None };
+    let (st, m) = srv.post::<_, Message>(&format!("/channels/{}/messages", dm.id), Some(&alice.token), &send).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let m = m.unwrap();
+    assert!(matches!(bob_gw.next_event().await, Event::MessageCreate(x) if x.id == m.id));
+
+    // Посторонний не видит переписку
+    assert_eq!(srv.get::<Vec<Message>>(&format!("/channels/{}/messages", dm.id), &carol.token).await.0, StatusCode::NOT_FOUND);
+
+    // У Bob личка в непрочитанном (без сервера) и в списке диалогов
+    let (_, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
+    match ready {
+        ServerOp::Ready { unread, .. } => assert_eq!(unread, vec![UnreadChannel { guild_id: None, channel_id: dm.id, last_message_id: m.id }]),
+        other => panic!("ожидался READY, пришло {other:?}"),
+    }
+    let (_, dms) = srv.get::<Vec<DmChannel>>("/users/@me/channels", &bob.token).await;
+    let dms = dms.unwrap();
+    assert_eq!((dms.len(), dms[0].last_message_id), (1, Some(m.id)));
+
+    // В личке нет «модераторов»: Bob не может удалить сообщение Alice
+    let (st, _) = srv.req::<(), ApiError>(reqwest::Method::DELETE, &format!("/channels/{}/messages/{}", dm.id, m.id), Some(&bob.token), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
 
     drop((alice_gw, bob_gw));
     srv.drop_db().await;

@@ -123,6 +123,15 @@ impl Api {
         self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/channels"), None).await
     }
 
+    /// Открыть (или создать) личный канал с пользователем
+    pub async fn open_dm(&self, user: Snowflake) -> Result<DmChannel> {
+        self.call(Method::POST, "/users/@me/channels", Some(&CreateDmRequest { recipient_id: user })).await
+    }
+
+    pub async fn dms(&self) -> Result<Vec<DmChannel>> {
+        self.call::<(), _>(Method::GET, "/users/@me/channels", None).await
+    }
+
     pub async fn create_channel(&self, guild: Snowflake, name: &str, kind: ChannelKind, parent: Option<Snowflake>) -> Result<Channel> {
         let req = CreateChannelRequest { name: name.into(), kind, parent_id: parent };
         self.call(Method::POST, &format!("/guilds/{guild}/channels"), Some(&req)).await

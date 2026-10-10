@@ -1,8 +1,10 @@
 //! feather-server: REST API + realtime-шлюз + выдача токенов LiveKit (docs/03-architecture.md).
 
+mod access;
 mod auth;
 mod bus;
 pub mod config;
+mod dms;
 mod error;
 mod gateway;
 mod guilds;
@@ -54,6 +56,7 @@ fn router(state: Shared) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/users/@me", get(auth::me))
         .route("/users/@me/guilds", get(guilds::my_guilds))
+        .route("/users/@me/channels", get(dms::list_dms).post(dms::open_dm))
         .route("/guilds", post(guilds::create_guild))
         .route("/guilds/{id}", get(guilds::get_guild))
         .route("/guilds/{id}/channels", get(guilds::list_channels).post(guilds::create_channel))

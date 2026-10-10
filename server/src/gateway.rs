@@ -189,10 +189,10 @@ impl Session {
                         ClientOp::Typing { channel_id } => {
                             // Лимит, чтобы «печатает» нельзя было превратить в спам событиями
                             if st.limiter.check(&format!("typing:{}", me_user.id), crate::ratelimit::TYPING).is_ok()
-                                && let Ok((channel, _)) = channel_for_member(&st.db, channel_id, me_user.id).await
-                                && channel.kind == ChannelKind::Text
+                                && let Ok(access) = crate::access::channel_access(&st.db, channel_id, me_user.id).await
+                                && access.can_write()
                             {
-                                st.bus.publish(Target::Guild(channel.guild_id), Event::TypingStart { channel_id, user: me_user.clone() });
+                                access.publish(&st.bus, Event::TypingStart { channel_id, user: me_user.clone() });
                             }
                         }
                         ClientOp::VoiceState { channel_id, muted, deafened } => {

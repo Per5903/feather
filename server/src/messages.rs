@@ -4,15 +4,14 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use feather_protocol::{AckRequest, ChannelKind, EditMessageRequest, Event, Message, SendMessageRequest, Snowflake, UnreadChannel, User};
+use feather_protocol::{AckRequest, EditMessageRequest, Event, Message, SendMessageRequest, Snowflake, UnreadChannel, User};
 use serde::Deserialize;
 use sqlx::PgPool;
 
 use crate::Shared;
 use crate::auth::AuthUser;
-use crate::bus::Target;
 use crate::error::{ApiResult, AppError};
-use crate::guilds::channel_for_member;
+use crate::access::channel_access;
 use crate::ratelimit;
 
 const MAX_CONTENT: usize = 4000;
@@ -68,7 +67,7 @@ pub async fn history(
     Path(channel_id): Path<Snowflake>,
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Json<Vec<Message>>> {
-    channel_for_member(&st.db, channel_id, user.id()).await?;
+    channel_access(&st.db, channel_id, user.id()).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
     let sql = format!("{SELECT_MESSAGE} WHERE m.channel_id = $1 AND ($2::bigint IS NULL OR m.id < $2) ORDER BY m.id DESC LIMIT $3");
     let rows: Vec<MessageRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -87,8 +86,8 @@ pub async fn send(
     Json(req): Json<SendMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<Message>)> {
     st.limiter.check(&format!("msg:{}", user.id()), ratelimit::MESSAGES).map_err(AppError::rate_limited)?;
-    let (channel, _) = channel_for_member(&st.db, channel_id, user.id()).await?;
-    if channel.kind != ChannelKind::Text {
+    let access = channel_access(&st.db, channel_id, user.id()).await?;
+    if !access.can_write() {
         return Err(AppError::BadRequest("not_text_channel", "писать можно только в текстовый канал".into()));
     }
     let content = validate_content(&req.content)?;
@@ -115,7 +114,7 @@ pub async fn send(
         edited_at: None,
         nonce: req.nonce,
     };
-    st.bus.publish(Target::Guild(channel.guild_id), Event::MessageCreate(message.clone()));
+    access.publish(&st.bus, Event::MessageCreate(message.clone()));
     Ok((StatusCode::CREATED, Json(message)))
 }
 
@@ -125,7 +124,7 @@ pub async fn edit(
     Path((channel_id, message_id)): Path<(Snowflake, Snowflake)>,
     Json(req): Json<EditMessageRequest>,
 ) -> ApiResult<Json<Message>> {
-    let (channel, _) = channel_for_member(&st.db, channel_id, user.id()).await?;
+    let access = channel_access(&st.db, channel_id, user.id()).await?;
     let content = validate_content(&req.content)?;
     let updated = sqlx::query("UPDATE messages SET content = $1, edited_at = now() WHERE id = $2 AND channel_id = $3 AND author_id = $4")
         .bind(&content)
@@ -141,7 +140,7 @@ pub async fn edit(
         return Err(AppError::Forbidden);
     }
     let message = load(&st.db, channel_id, message_id).await?;
-    st.bus.publish(Target::Guild(channel.guild_id), Event::MessageUpdate(message.clone()));
+    access.publish(&st.bus, Event::MessageUpdate(message.clone()));
     Ok(Json(message))
 }
 
@@ -150,14 +149,14 @@ pub async fn delete(
     user: AuthUser,
     Path((channel_id, message_id)): Path<(Snowflake, Snowflake)>,
 ) -> ApiResult<StatusCode> {
-    let (channel, owner) = channel_for_member(&st.db, channel_id, user.id()).await?;
+    let access = channel_access(&st.db, channel_id, user.id()).await?;
     let message = load(&st.db, channel_id, message_id).await?;
     // Удалить может автор или владелец сервера (модерация)
-    if message.author.id != user.id() && owner != user.id() {
+    if message.author.id != user.id() && !access.is_moderator(user.id()) {
         return Err(AppError::Forbidden);
     }
     sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id.0 as i64).execute(&st.db).await?;
-    st.bus.publish(Target::Guild(channel.guild_id), Event::MessageDelete { id: message_id, channel_id });
+    access.publish(&st.bus, Event::MessageDelete { id: message_id, channel_id });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -182,21 +181,23 @@ pub async fn ack(
     Path(channel_id): Path<Snowflake>,
     Json(req): Json<AckRequest>,
 ) -> ApiResult<StatusCode> {
-    channel_for_member(&st.db, channel_id, user.id()).await?;
+    channel_access(&st.db, channel_id, user.id()).await?;
     mark_read(&st.db, user.id(), channel_id, req.message_id).await?;
-    st.bus.publish(Target::User(user.id()), Event::ChannelAck { channel_id, message_id: req.message_id });
+    st.bus.publish(crate::bus::Target::User(user.id()), Event::ChannelAck { channel_id, message_id: req.message_id });
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Текстовые каналы пользователя, где есть сообщения новее его отметки о прочтении
 pub async fn unread_channels(db: &PgPool, user: Snowflake) -> ApiResult<Vec<UnreadChannel>> {
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(Option<i64>, i64, i64)> = sqlx::query_as(
         "SELECT c.guild_id, c.id, lm.last_id
            FROM channels c
-           JOIN guild_members gm ON gm.guild_id = c.guild_id AND gm.user_id = $1
+           LEFT JOIN guild_members gm ON gm.guild_id = c.guild_id AND gm.user_id = $1
+           LEFT JOIN channel_recipients cr ON cr.channel_id = c.id AND cr.user_id = $1
            CROSS JOIN LATERAL (SELECT max(id) AS last_id FROM messages WHERE channel_id = c.id) lm
            LEFT JOIN read_states rs ON rs.channel_id = c.id AND rs.user_id = $1
-          WHERE c.kind = 'text' AND lm.last_id IS NOT NULL
+          WHERE c.kind IN ('text', 'dm') AND (gm.user_id IS NOT NULL OR cr.user_id IS NOT NULL)
+            AND lm.last_id IS NOT NULL
             AND (rs.last_read_message_id IS NULL OR lm.last_id > rs.last_read_message_id)",
     )
     .bind(user.0 as i64)
@@ -205,7 +206,7 @@ pub async fn unread_channels(db: &PgPool, user: Snowflake) -> ApiResult<Vec<Unre
     Ok(rows
         .into_iter()
         .map(|(g, c, m)| UnreadChannel {
-            guild_id: Snowflake(g as u64),
+            guild_id: g.map(|g| Snowflake(g as u64)),
             channel_id: Snowflake(c as u64),
             last_message_id: Snowflake(m as u64),
         })

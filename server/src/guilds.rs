@@ -31,6 +31,7 @@ fn kind_str(k: ChannelKind) -> &'static str {
         ChannelKind::Text => "text",
         ChannelKind::Voice => "voice",
         ChannelKind::Category => "category",
+        ChannelKind::Dm => "dm",
     }
 }
 
@@ -41,6 +42,7 @@ pub fn channel_from_row((id, guild_id, kind, name, parent_id, position): Channel
         kind: match kind.as_str() {
             "voice" => ChannelKind::Voice,
             "category" => ChannelKind::Category,
+            "dm" => ChannelKind::Dm,
             _ => ChannelKind::Text,
         },
         name,
@@ -182,6 +184,9 @@ pub async fn create_channel(
         return Err(AppError::Forbidden);
     }
     let name = validate_name(&req.name, "название канала")?;
+    if req.kind == ChannelKind::Dm {
+        return Err(AppError::BadRequest("bad_kind", "личный канал создаётся через /users/@me/channels".into()));
+    }
     if let Some(parent) = req.parent_id {
         let ok: Option<(i64,)> = sqlx::query_as("SELECT id FROM channels WHERE id = $1 AND guild_id = $2 AND kind = 'category'")
             .bind(parent.0 as i64)

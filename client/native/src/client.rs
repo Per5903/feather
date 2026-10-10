@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, VoiceEvent, VoiceOptions, VoiceSession};
-use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, Event, Guild, Message, Snowflake, User, VoiceState};
+use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, Message, Snowflake, User, VoiceState};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
@@ -158,6 +158,8 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_logout(|| post(|app| app.logout()));
     ui.on_invite(|| post(|app| app.invite()));
     ui.on_add_channel(|i| post(move |app| app.ask_add_channel(i as usize)));
+    ui.on_select_home(|| post(|app| app.select_home(None)));
+    ui.on_message_member(|i| post(move |app| app.message_member(i as usize)));
 
     let weak = ui.as_weak();
     ui.on_create_guild_dialog(move || open_dialog(&weak, "create"));
@@ -260,8 +262,13 @@ struct App {
     guild: Option<Snowflake>,
     /// В порядке отображения
     channels: Vec<Channel>,
-    /// Непрочитанные каналы → их сервер (метка сервера = есть хоть один его канал)
-    unread: HashMap<Snowflake, Snowflake>,
+    /// Непрочитанные каналы → их сервер (None — личный). Метка сервера = есть хоть один его канал
+    unread: HashMap<Snowflake, Option<Snowflake>>,
+    /// Режим «Личные сообщения» и список диалогов
+    dm_mode: bool,
+    dms: Vec<DmChannel>,
+    /// Участники в том порядке, в каком показаны (для кнопки «Написать»)
+    members_view: Vec<User>,
     channel: Option<Snowflake>,
     members: Vec<User>,
     /// Сообщения открытого канала, от старых к новым
@@ -321,6 +328,9 @@ impl App {
             guild: None,
             channels: Vec::new(),
             unread: HashMap::new(),
+            dm_mode: false,
+            dms: Vec::new(),
+            members_view: Vec::new(),
             channel: None,
             members: Vec::new(),
             messages: Vec::new(),
@@ -382,12 +392,18 @@ impl App {
                 // Инициалы как в Discord: первые буквы слов, максимум 3
                 initial: g.name.split_whitespace().filter_map(|w| w.chars().next()).take(3).collect::<String>().into(),
                 active: Some(g.id) == self.guild,
-                unread: Some(g.id) != self.guild && self.unread.values().any(|gid| *gid == g.id),
+                unread: Some(g.id) != self.guild && self.unread.values().any(|gid| *gid == Some(g.id)),
             })
             .collect();
         ui.set_guilds(ModelRc::new(VecModel::from(items)));
-        let name = self.guild.and_then(|id| self.guilds.iter().find(|g| g.id == id)).map(|g| g.name.clone()).unwrap_or_default();
+        let name = if self.dm_mode {
+            "Личные сообщения".to_owned()
+        } else {
+            self.guild.and_then(|id| self.guilds.iter().find(|g| g.id == id)).map(|g| g.name.clone()).unwrap_or_default()
+        };
         ui.set_guild_name(name.into());
+        ui.set_in_dm(self.dm_mode);
+        ui.set_home_unread(self.unread.values().any(|g| g.is_none()));
     }
 
     fn refresh_channels(&self) {
@@ -401,6 +417,7 @@ impl App {
                     Kind::Text => ChannelKind::Text,
                     Kind::Voice => ChannelKind::Voice,
                     Kind::Category => ChannelKind::Category,
+                    Kind::Dm => ChannelKind::Dm,
                 },
                 active: Some(c.id) == self.channel || self.voice.as_ref().is_some_and(|v| v.channel == c.id),
                 unread: self.unread.contains_key(&c.id),
@@ -412,7 +429,7 @@ impl App {
         ui.set_channels(ModelRc::new(VecModel::from(items)));
         let current = self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id));
         ui.set_channel_name(current.map(|c| c.name.clone()).unwrap_or_default().into());
-        ui.set_can_write(current.is_some_and(|c| c.kind == Kind::Text));
+        ui.set_can_write(current.is_some_and(|c| matches!(c.kind, Kind::Text | Kind::Dm)));
     }
 
     fn voice_members(&self, channel: Snowflake) -> ModelRc<VoiceMember> {
@@ -463,15 +480,97 @@ impl App {
         self.refresh_channels();
     }
 
-    fn refresh_members(&self) {
+    fn refresh_members(&mut self) {
         let Some(ui) = self.ui() else { return };
-        let mut ms: Vec<&User> = self.members.iter().collect();
+        let mut ms: Vec<User> = self.members.clone();
         ms.sort_by_key(|u| u.username.to_lowercase());
         let items: Vec<Member> = ms
-            .into_iter()
-            .map(|u| Member { name: u.username.as_str().into(), initial: initial(&u.username), tint: user_color(u.id) })
+            .iter()
+            .map(|u| Member {
+                name: u.username.as_str().into(),
+                initial: initial(&u.username),
+                tint: user_color(u.id),
+                can_message: u.id != self.me.id,
+            })
             .collect();
+        self.members_view = ms;
         ui.set_members(ModelRc::new(VecModel::from(items)));
+    }
+
+    // ------------------------------------------------------------ личные сообщения
+
+    /// Личный канал как элемент списка каналов (имя — собеседники)
+    fn dm_as_channel(d: &DmChannel) -> Channel {
+        let name = d.recipients.iter().map(|u| u.display_name.clone().unwrap_or(u.username.clone())).collect::<Vec<_>>().join(", ");
+        Channel { id: d.id, guild_id: Snowflake(0), kind: Kind::Dm, name, parent_id: None, position: 0 }
+    }
+
+    /// Свежие диалоги сверху
+    fn sort_dms(&mut self) {
+        self.dms.sort_by_key(|d| std::cmp::Reverse(d.last_message_id.unwrap_or(d.id)));
+        if self.dm_mode {
+            self.channels = self.dms.iter().map(Self::dm_as_channel).collect();
+        }
+    }
+
+    /// Перейти в «Личные сообщения»; `open` — сразу открыть этот диалог
+    fn select_home(&mut self, open: Option<Snowflake>) {
+        if let Some(prev) = self.guild.take() {
+            self.gw_send(ClientOp::UnsubscribeGuild { guild_id: prev });
+        }
+        self.dm_mode = true;
+        self.channel = None;
+        self.messages.clear();
+        self.model.set_vec(Vec::new());
+        self.members.clear();
+        self.refresh_guilds();
+        self.refresh_members();
+        self.load_gen += 1;
+        let (api, generation) = (self.api.clone(), self.load_gen);
+        self.rt.spawn(async move {
+            let res = api.dms().await;
+            post(move |app| {
+                if app.load_gen != generation || !app.dm_mode {
+                    return;
+                }
+                match res {
+                    Ok(dms) => {
+                        app.dms = dms;
+                        app.sort_dms();
+                        let target = open
+                            .and_then(|id| app.channels.iter().find(|c| c.id == id))
+                            .or_else(|| app.channels.first())
+                            .cloned();
+                        match target {
+                            Some(c) => app.select_channel(&c),
+                            None => {
+                                app.refresh_channels();
+                                app.set_status("Диалогов пока нет: наведите на участника сервера и нажмите «Написать»");
+                            }
+                        }
+                    }
+                    Err(e) => app.set_status(format!("Не удалось загрузить диалоги: {e}")),
+                }
+            });
+        });
+    }
+
+    /// «Написать» участнику: открыть (или создать) личный канал и перейти в него
+    fn message_member(&mut self, i: usize) {
+        let Some(user) = self.members_view.get(i).filter(|u| u.id != self.me.id).cloned() else { return };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            let res = api.open_dm(user.id).await;
+            post(move |app| match res {
+                Ok(dm) => {
+                    if !app.dms.iter().any(|d| d.id == dm.id) {
+                        app.dms.push(dm.clone());
+                    }
+                    app.select_home(Some(dm.id));
+                }
+                Err(e) => app.set_status(format!("Не удалось открыть диалог: {e}")),
+            });
+        });
     }
 
     /// Я владелец открытого сервера — могу удалять чужие сообщения
@@ -505,6 +604,7 @@ impl App {
             self.gw_send(ClientOp::UnsubscribeGuild { guild_id: prev });
         }
         self.guild = Some(id);
+        self.dm_mode = false;
         self.gw_send(ClientOp::SubscribeGuild { guild_id: id });
         self.channel = None;
         self.channels.clear();
@@ -557,14 +657,22 @@ impl App {
                 self.join_voice(c);
                 return;
             }
-            Kind::Text => {}
+            Kind::Text | Kind::Dm => {}
         }
         self.set_status("");
         self.typing.clear();
         self.refresh_typing();
         self.cancel_edit();
         self.channel = Some(c.id);
-        session::remember(&c.guild_id.to_string(), &c.id.to_string());
+        if c.kind == Kind::Dm {
+            // В личке справа — собеседник и я
+            let dm = self.dms.iter().find(|d| d.id == c.id);
+            self.members = dm.map(|d| d.recipients.clone()).unwrap_or_default();
+            self.members.push(self.me.clone());
+            self.refresh_members();
+        } else {
+            session::remember(&c.guild_id.to_string(), &c.id.to_string());
+        }
         self.unread.remove(&c.id);
         self.refresh_channels();
         self.refresh_guilds();
@@ -835,6 +943,14 @@ impl App {
                     self.unread.remove(&c);
                 }
                 self.set_status("");
+                if self.dm_mode {
+                    // Переподключение в личных сообщениях: догружаем открытый диалог
+                    self.refresh_guilds();
+                    if let Some(c) = self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id)).cloned() {
+                        self.select_channel(&c);
+                    }
+                    return;
+                }
                 match self.guild.filter(|g| self.guilds.iter().any(|x| x.id == *g)) {
                     // Переподключение: подписка на сервере сбросилась, возобновляем и догружаем пропущенное
                     Some(g) => {
@@ -844,6 +960,8 @@ impl App {
                         }
                         self.refresh_guilds();
                     }
+                    // Для снимков интерфейса в автотестах: сразу в «Личные сообщения»
+                    None if std::env::var_os("FEATHER_TEST_HOME").is_some() => self.select_home(None),
                     None => match session::load()
                         .and_then(|s| s.last_guild)
                         .and_then(|lg| self.guilds.iter().find(|g| g.id.to_string() == lg).map(|g| g.id))
@@ -884,9 +1002,18 @@ impl App {
                 if Some(m.channel_id) == self.channel {
                     self.add_message(m);
                     self.ack_latest();
+                } else if let Some(d) = self.dms.iter_mut().find(|d| d.id == m.channel_id) {
+                    // Личное сообщение в неоткрытом диалоге: метка на «Личных сообщениях», диалог наверх
+                    d.last_message_id = Some(m.id);
+                    if m.author.id != self.me.id {
+                        self.unread.insert(m.channel_id, None);
+                    }
+                    self.sort_dms();
+                    self.refresh_guilds();
+                    self.refresh_channels();
                 } else if m.author.id != self.me.id && self.channels.iter().any(|c| c.id == m.channel_id) {
                     if let Some(g) = self.guild {
-                        self.unread.insert(m.channel_id, g);
+                        self.unread.insert(m.channel_id, Some(g));
                     }
                     self.refresh_channels();
                 }
@@ -924,6 +1051,13 @@ impl App {
                     self.refresh_members();
                 }
             }
+            Event::DmCreate(d) => {
+                if !self.dms.iter().any(|x| x.id == d.id) {
+                    self.dms.push(d);
+                    self.sort_dms();
+                    self.refresh_channels();
+                }
+            }
             Event::GuildCreate(g) => {
                 if !self.guilds.iter().any(|x| x.id == g.id) {
                     self.guilds.push(g);
@@ -932,7 +1066,7 @@ impl App {
             }
             Event::UnreadUpdate { guild_id, channel_id, author_id, .. } => {
                 if author_id != self.me.id {
-                    self.unread.insert(channel_id, guild_id);
+                    self.unread.insert(channel_id, Some(guild_id));
                     self.refresh_guilds();
                 }
             }

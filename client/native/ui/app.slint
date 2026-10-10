@@ -25,6 +25,8 @@ export struct Member {
     name: string,
     initial: string,
     tint: color,
+    /// Показывать кнопку «Написать» (не я)
+    can-message: bool,
 }
 
 export struct GuildItem {
@@ -34,7 +36,7 @@ export struct GuildItem {
     unread: bool,
 }
 
-export enum ChannelKind { text, voice, category }
+export enum ChannelKind { text, voice, category, dm }
 
 export struct VoiceMember {
     name: string,
@@ -112,12 +114,12 @@ component IconButton inherits Rectangle {
     }
 }
 
-component MessageRow inherits Rectangle {
+// Строка сама — TouchArea: кнопки действий её потомки, и наведение не «теряется» при переходе на них
+component MessageRow inherits TouchArea {
     in property <Msg> m;
     callback edit();
     callback delete();
-    background: ta.has-hover ? Theme.row-hover : transparent;
-    ta := TouchArea { }
+    Rectangle { background: root.has-hover ? Theme.row-hover : transparent; }
     HorizontalLayout {
         padding-left: 16px;
         padding-right: 16px;
@@ -133,7 +135,7 @@ component MessageRow inherits Rectangle {
             }
             if !m.head: Text {
                 height: 22px;
-                text: ta.has-hover ? m.time : "";
+                text: root.has-hover ? m.time : "";
                 color: Theme.dim;
                 font-size: 11px;
                 horizontal-alignment: right;
@@ -185,7 +187,7 @@ component MessageRow inherits Rectangle {
         }
     }
     // Действия при наведении: изменить / удалить
-    if ta.has-hover && (m.own || m.can-delete): Rectangle {
+    if root.has-hover && (m.own || m.can-delete): Rectangle {
         x: parent.width - self.width - 16px;
         y: 4px;
         width: actions.preferred-width;
@@ -240,7 +242,7 @@ component ChannelRow inherits VerticalLayout {
                 }
             }
             Text {
-                text: c.kind == ChannelKind.text ? "# " + c.name : c.name;
+                text: c.kind == ChannelKind.text ? "# " + c.name : c.kind == ChannelKind.dm ? "@ " + c.name : c.name;
                 color: c.kind == ChannelKind.category ? Theme.dim : lit ? Theme.text : Theme.dim;
                 font-size: c.kind == ChannelKind.category ? 12px : 15px;
                 font-weight: c.kind == ChannelKind.category || c.unread ? 600 : 400;
@@ -590,6 +592,11 @@ export component AppWindow inherits Window {
     /// Долистали до начала ленты: пора подгрузить сообщения постарше
     callback load-older();
     callback select-guild(int);
+    // ---- личные сообщения
+    in property <bool> in-dm;
+    in property <bool> home-unread;
+    callback select-home();
+    callback message-member(int);
 
     // ---- голос
     /// Название голосового канала, к которому подключены; "" — не подключены
@@ -676,6 +683,40 @@ export component AppWindow inherits Window {
             padding-top: 12px;
             spacing: 8px;
             alignment: start;
+            // Личные сообщения
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    property <bool> lit: in-dm || hta.has-hover;
+                    width: 44px;
+                    height: 44px;
+                    border-radius: lit ? 14px : 22px;
+                    background: lit ? Theme.accent : Theme.bg2;
+                    animate border-radius, background { duration: 150ms; }
+                    hta := TouchArea { clicked => { root.select-home(); } }
+                    Icon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 22px;
+                        height: 22px;
+                        // Облачко чата
+                        commands: "M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z";
+                        fill: lit ? #fff : Theme.text;
+                    }
+                    if home-unread && !in-dm: Rectangle {
+                        x: -10px;
+                        y: (parent.height - self.height) / 2;
+                        width: 4px;
+                        height: 8px;
+                        border-radius: 2px;
+                        background: Theme.text;
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle { width: 32px; height: 2px; background: Theme.bg2; }
+            }
             for g[i] in guilds: HorizontalLayout {
                 alignment: center;
                 Rectangle {
@@ -757,7 +798,7 @@ export component AppWindow inherits Window {
                             overflow: elide;
                             horizontal-stretch: 1;
                         }
-                        if guild-name != "": VerticalLayout {
+                        if guild-name != "" && !in-dm: VerticalLayout {
                             alignment: center;
                             IconButton {
                                 // «Пригласить»: человек с плюсом
@@ -887,7 +928,7 @@ export component AppWindow inherits Window {
                         padding-right: 16px;
                         spacing: 12px;
                         Text {
-                            text: channel-name == "" ? "" : "# " + channel-name;
+                            text: channel-name == "" ? "" : (in-dm ? "@ " : "# ") + channel-name;
                             color: Theme.text;
                             font-weight: 600;
                             vertical-alignment: center;
@@ -970,7 +1011,7 @@ export component AppWindow inherits Window {
                         if input.text == "": Text {
                             x: 14px;
                             height: parent.height;
-                            text: can-write ? "Написать в #" + channel-name : "Выберите текстовый канал";
+                            text: !can-write ? "Выберите текстовый канал" : in-dm ? "Написать @" + channel-name : "Написать в #" + channel-name;
                             color: Theme.dim;
                             vertical-alignment: center;
                         }
@@ -1010,13 +1051,15 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                for u in members: Rectangle {
+                for u[i] in members: mta := TouchArea {
                     height: 42px;
-                    border-radius: 4px;
-                    background: mta.has-hover ? Theme.hover : transparent;
-                    mta := TouchArea { }
+                    Rectangle {
+                        border-radius: 4px;
+                        background: mta.has-hover ? Theme.hover : transparent;
+                    }
                     HorizontalLayout {
                         padding-left: 8px;
+                        padding-right: 6px;
                         spacing: 10px;
                         VerticalLayout {
                             alignment: center;
@@ -1027,6 +1070,15 @@ export component AppWindow inherits Window {
                             color: mta.has-hover ? Theme.text : Theme.dim;
                             vertical-alignment: center;
                             overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        if u.can-message && mta.has-hover: VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // «Написать в личку»
+                                icon: "M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z";
+                                clicked => { root.message-member(i); }
+                            }
                         }
                     }
                 }
