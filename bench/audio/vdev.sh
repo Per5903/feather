@@ -10,6 +10,11 @@ cd "$(dirname "$0")"
 STATE=/tmp/feather-vdev-modules
 PLAY_PID=/tmp/feather-vdev-play.pid
 
+stop_play() {
+  [ -f "$PLAY_PID" ] && kill "$(cat "$PLAY_PID")" 2>/dev/null || true
+  rm -f "$PLAY_PID"
+}
+
 case "${1:-}" in
   up)
     : > "$STATE"
@@ -28,11 +33,10 @@ case "${1:-}" in
     while true; do pw-play --target feather_vmic_sink "$file" & wait $!; done
     ;;
   stop)
-    [ -f "$PLAY_PID" ] && kill "$(cat "$PLAY_PID")" 2>/dev/null || true
-    rm -f "$PLAY_PID"
+    stop_play
     ;;
   down)
-    "$0" stop
+    stop_play
     [ -f "$STATE" ] && tac "$STATE" | xargs -r -n1 pactl unload-module || true
     rm -f "$STATE"
     echo "виртуальные устройства удалены"
