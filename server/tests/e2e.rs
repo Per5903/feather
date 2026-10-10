@@ -33,6 +33,7 @@ impl TestServer {
         let admin = sqlx::PgPool::connect(&admin_url).await.expect("Postgres не запущен? docker compose up -d");
         admin.execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).await.unwrap();
         let mut cfg = feather_server::Config::from_env();
+        cfg.data_dir = std::env::temp_dir().join(&db_name);
         cfg.database_url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
         let app = feather_server::build(cfg).await.expect("сервер не собрался");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,6 +51,7 @@ impl TestServer {
             .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.db_name)))
             .await
             .unwrap();
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(&self.db_name));
     }
 
     fn url(&self, path: &str) -> String {
@@ -172,7 +174,7 @@ async fn full_flow() {
     // Чужой сервер не виден
     assert_eq!(srv.get::<Guild>(&format!("/guilds/{gid}"), &bob.token).await.0, StatusCode::NOT_FOUND);
     let (st, _) = srv
-        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&bob.token), &SendMessageRequest { content: "хак".into(), reply_to_id: None, nonce: None })
+        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&bob.token), &SendMessageRequest { content: "хак".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] })
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "писать в чужой сервер нельзя");
 
@@ -199,7 +201,7 @@ async fn full_flow() {
     bob_gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
     assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck); // подписка точно обработана
 
-    let send = SendMessageRequest { content: "  го в рейд  ".into(), reply_to_id: None, nonce: Some("n-1".into()) };
+    let send = SendMessageRequest { content: "  го в рейд  ".into(), reply_to_id: None, nonce: Some("n-1".into()), attachment_ids: vec![] };
     let (st, sent) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &send).await;
     assert_eq!(st, StatusCode::CREATED);
     let sent = sent.unwrap();
@@ -218,7 +220,7 @@ async fn full_flow() {
     bob_gw.send(&ClientOp::Heartbeat { seq: 1 }).await;
     assert_eq!(bob_gw.next().await, ServerOp::HeartbeatAck);
     let (_, second) = srv
-        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &SendMessageRequest { content: "кто на арену?".into(), reply_to_id: Some(sent.id), nonce: None })
+        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &SendMessageRequest { content: "кто на арену?".into(), reply_to_id: Some(sent.id), nonce: None, attachment_ids: vec![] })
         .await;
     let second = second.unwrap();
     match bob_gw.next_event().await {
@@ -249,7 +251,7 @@ async fn full_flow() {
 
     // --- удаление: автор или владелец сервера
     let (_, bobs) = srv
-        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&bob.token), &SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None })
+        .post::<_, Message>(&format!("/channels/{text}/messages"), Some(&bob.token), &SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] })
         .await;
     let bobs = bobs.unwrap();
     assert!(matches!(bob_gw.next_event().await, Event::MessageCreate(_)));
@@ -309,7 +311,7 @@ async fn read_states() {
 
     let mut last = None;
     for t in ["раз", "два"] {
-        let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &SendMessageRequest { content: t.into(), reply_to_id: None, nonce: None }).await;
+        let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &SendMessageRequest { content: t.into(), reply_to_id: None, nonce: None, attachment_ids: vec![] }).await;
         last = m.map(|m| m.id);
     }
     let last = last.unwrap();
@@ -442,7 +444,7 @@ async fn rate_limits() {
     // Спам сообщениями: 5 подряд можно, шестое — 429
     let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "S".into() }).await;
     let text = g.unwrap().channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
-    let msg = SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None };
+    let msg = SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] };
     for _ in 0..5 {
         assert_eq!(srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await.0, StatusCode::CREATED);
     }
@@ -530,7 +532,7 @@ async fn direct_messages() {
     let (mut alice_gw, _) = GatewayClient::connect(srv.addr, &alice.token).await;
     alice_gw.send(&ClientOp::Typing { channel_id: dm.id }).await;
     assert!(matches!(bob_gw.next_event().await, Event::TypingStart { channel_id, .. } if channel_id == dm.id));
-    let send = SendMessageRequest { content: "привет в личку".into(), reply_to_id: None, nonce: None };
+    let send = SendMessageRequest { content: "привет в личку".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] };
     let (st, m) = srv.post::<_, Message>(&format!("/channels/{}/messages", dm.id), Some(&alice.token), &send).await;
     assert_eq!(st, StatusCode::CREATED);
     let m = m.unwrap();
@@ -594,7 +596,7 @@ async fn roles_and_moderation() {
 
     // Модератор: создаёт каналы и удаляет чужие сообщения
     assert_eq!(srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&bob.token), &ch).await.0, StatusCode::CREATED);
-    let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&carol.token), &SendMessageRequest { content: "флуд".into(), reply_to_id: None, nonce: None }).await;
+    let (_, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&carol.token), &SendMessageRequest { content: "флуд".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] }).await;
     let (st, _) = srv.req::<(), ApiError>(reqwest::Method::DELETE, &format!("/channels/{text}/messages/{}", m.unwrap().id), Some(&bob.token), None).await;
     assert_eq!(st, StatusCode::NO_CONTENT);
 
@@ -631,7 +633,7 @@ async fn roles_and_moderation() {
     // у роли «Модератор» этого права нет, а @everyone его больше не даёт
     let everyone = RoleRequest { permissions: Some(CREATE_INVITE | VOICE_CONNECT), ..Default::default() };
     srv.req::<_, Role>(reqwest::Method::PATCH, &format!("/guilds/{gid}/roles/{gid}"), Some(&alice.token), Some(&everyone)).await;
-    let msg = SendMessageRequest { content: "можно?".into(), reply_to_id: None, nonce: None };
+    let msg = SendMessageRequest { content: "можно?".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] };
     assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&bob.token), &msg).await.0, StatusCode::FORBIDDEN);
     assert_eq!(srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await.0, StatusCode::CREATED, "владелец может всё");
 
@@ -642,5 +644,75 @@ async fn roles_and_moderation() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
     drop(carol_gw);
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn attachments() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let carol = srv.signup("carol").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "A".into() }).await;
+    let g = g.unwrap();
+    let text = g.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{}/invites", g.guild.id), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", inv.unwrap().code), Some(&bob.token), &()).await;
+
+    let upload = |token: String, name: &'static str, ctype: &'static str, bytes: Vec<u8>| {
+        let req = srv.http.post(srv.url(&format!("/channels/{text}/attachments?filename={name}"))).bearer_auth(token).header("content-type", ctype).body(bytes);
+        async move { req.send().await.unwrap() }
+    };
+
+    // Настоящая картинка 640×480: размеры и превью
+    let mut png = Vec::new();
+    image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let resp = upload(alice.token.clone(), "скрин.png", "image/png", png).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let img: Attachment = resp.json().await.unwrap();
+    assert_eq!((img.width, img.height, img.has_thumb, img.content_type.as_str()), (Some(640), Some(480), true, "image/png"));
+
+    // Обычный файл и «картинка», которая на самом деле не картинка
+    let txt: Attachment = upload(alice.token.clone(), "../../etc/passwd", "text/plain", b"hello".to_vec()).await.json().await.unwrap();
+    assert_eq!((txt.filename.as_str(), txt.has_thumb), ("passwd", false), "путь из имени файла отрезается");
+    let fake: Attachment = upload(alice.token.clone(), "x.png", "image/png", b"not an image".to_vec()).await.json().await.unwrap();
+    assert_eq!(fake.content_type, "application/octet-stream", "тип картинки — только по содержимому");
+
+    // Сообщение только из вложений (без текста)
+    let send = SendMessageRequest { content: "".into(), attachment_ids: vec![img.id, txt.id], ..Default::default() };
+    let (st, m) = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &send).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let m = m.unwrap();
+    assert_eq!(m.attachments.iter().map(|a| a.id).collect::<Vec<_>>(), vec![img.id, txt.id]);
+    // Второй раз то же вложение не прикрепить; чужое — тоже
+    assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&alice.token), &send).await.0, StatusCode::BAD_REQUEST);
+    let steal = SendMessageRequest { content: "моё".into(), attachment_ids: vec![fake.id], ..Default::default() };
+    assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&bob.token), &steal).await.0, StatusCode::BAD_REQUEST);
+
+    // История отдаёт вложения
+    let (_, hist) = srv.get::<Vec<Message>>(&format!("/channels/{text}/messages"), &bob.token).await;
+    assert_eq!(hist.unwrap()[0].attachments.len(), 2);
+
+    // Участник скачивает оригинал и превью; посторонний — нет
+    let get = |path: String, token: String| {
+        let req = srv.http.get(srv.url(&path)).bearer_auth(token);
+        async move { req.send().await.unwrap() }
+    };
+    let orig = get(format!("/attachments/{}", img.id), bob.token.clone()).await;
+    assert_eq!(orig.status(), StatusCode::OK);
+    assert_eq!(orig.headers()["content-type"], "image/png");
+    let thumb = get(format!("/attachments/{}/thumb", img.id), bob.token.clone()).await.bytes().await.unwrap();
+    assert_eq!(&thumb[..2], &[0xFF, 0xD8], "превью — JPEG");
+    let t = image::load_from_memory(&thumb).unwrap();
+    assert!(t.width() <= 400 && t.height() <= 300);
+    let file = get(format!("/attachments/{}", txt.id), bob.token.clone()).await;
+    assert!(file.headers()["content-disposition"].to_str().unwrap().starts_with("attachment"), "не картинки — только скачивание");
+    assert_eq!(get(format!("/attachments/{}", img.id), carol.token.clone()).await.status(), StatusCode::NOT_FOUND);
+
+    // Удалили сообщение — файлов больше нет
+    srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/channels/{text}/messages/{}", m.id), Some(&alice.token), None).await;
+    assert_eq!(get(format!("/attachments/{}", img.id), alice.token.clone()).await.status(), StatusCode::NOT_FOUND);
     srv.drop_db().await;
 }

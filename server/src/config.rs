@@ -15,6 +15,8 @@ pub struct Config {
     pub session_ttl_days: i64,
     /// Сервер стоит за обратным прокси (Caddy): IP клиента брать из X-Forwarded-For
     pub trust_proxy: bool,
+    /// Каталог для файлов (вложения)
+    pub data_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -29,6 +31,7 @@ impl Config {
             livekit_api_secret: var("LIVEKIT_API_SECRET", "dev_secret_change_me_at_least_32_chars_long"),
             session_ttl_days: var("FEATHER_SESSION_TTL_DAYS", "30").parse().expect("FEATHER_SESSION_TTL_DAYS: нужно число"),
             trust_proxy: var("FEATHER_TRUST_PROXY", "0") == "1",
+            data_dir: var("FEATHER_DATA_DIR", "data").into(),
         }
     }
 }

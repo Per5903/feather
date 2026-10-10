@@ -14,3 +14,5 @@ bench/audio/src/
 bench/audio/*.wav
 bench/audio/street_*
 deploy/selfhost/.env
+server/data/
+data/

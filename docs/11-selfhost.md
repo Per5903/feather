@@ -39,6 +39,7 @@ curl https://chat.example.com/health      # ok
 ```bash
 git pull && docker compose up -d --build                                  # обновить
 docker compose exec postgres pg_dump -U feather feather > backup.sql      # копия базы
+docker run --rm -v feather_files:/data -v "$PWD":/b alpine tar czf /b/files.tgz -C /data .   # вложения
 ```
 
 Миграции базы применяются автоматически при старте сервера.

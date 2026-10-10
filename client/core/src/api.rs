@@ -204,7 +204,7 @@ impl Api {
     }
 
     pub async fn send_message(&self, channel: Snowflake, content: &str, nonce: String) -> Result<Message> {
-        let req = SendMessageRequest { content: content.into(), reply_to_id: None, nonce: Some(nonce) };
+        let req = SendMessageRequest { content: content.into(), nonce: Some(nonce), ..Default::default() };
         self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(&req)).await
     }
 }

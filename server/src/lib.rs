@@ -1,6 +1,7 @@
 //! feather-server: REST API + realtime-шлюз + выдача токенов LiveKit (docs/03-architecture.md).
 
 mod access;
+mod attachments;
 mod auth;
 mod bus;
 pub mod config;
@@ -72,6 +73,12 @@ fn router(state: Shared) -> Router {
         .route("/channels/{id}/messages", get(messages::history).post(messages::send))
         .route("/channels/{id}/messages/{mid}", patch(messages::edit).delete(messages::delete))
         .route("/channels/{id}/ack", post(messages::ack))
+        .route(
+            "/channels/{id}/attachments",
+            post(attachments::upload).layer(axum::extract::DefaultBodyLimit::max(attachments::MAX_SIZE + 1024)),
+        )
+        .route("/attachments/{id}", get(attachments::download))
+        .route("/attachments/{id}/thumb", get(attachments::thumbnail))
         .route("/channels/{id}/voice/join", post(voice::join));
     Router::new()
         .nest("/api/v1", api)

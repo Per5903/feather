@@ -155,6 +155,18 @@ pub struct DmChannel {
     pub last_message_id: Option<Snowflake>,
 }
 
+/// Вложение. Картинки: `has_thumb` — есть уменьшенная копия (`/attachments/{id}/thumb`)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub id: Snowflake,
+    pub filename: String,
+    pub size: u64,
+    pub content_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub has_thumb: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub id: Snowflake,
@@ -167,6 +179,8 @@ pub struct Message {
     /// Эхо `nonce` из запроса отправки: клиент сопоставляет своё «отправляется…» с ответом
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -230,13 +244,16 @@ pub struct CreateInviteRequest {
     pub ttl_secs: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
     pub reply_to_id: Option<Snowflake>,
     #[serde(default)]
     pub nonce: Option<String>,
+    /// Загруженные заранее вложения (POST /channels/{id}/attachments)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<Snowflake>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

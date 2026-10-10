@@ -24,6 +24,7 @@ const SELECT_MESSAGE: &str = "SELECT m.id, m.channel_id, m.content, m.reply_to_i
   FROM messages m JOIN users u ON u.id = m.author_id";
 
 fn message_from_row((id, channel_id, content, reply_to, edited_at, uid, username, display_name): MessageRow) -> Message {
+    let attachments = Vec::new();
     Message {
         id: Snowflake(id as u64),
         channel_id: Snowflake(channel_id as u64),
@@ -32,7 +33,20 @@ fn message_from_row((id, channel_id, content, reply_to, edited_at, uid, username
         reply_to_id: reply_to.map(|r| Snowflake(r as u64)),
         edited_at,
         nonce: None,
+        attachments,
     }
+}
+
+/// Подставить вложения в сообщения одной пачкой (один запрос на всю страницу истории)
+async fn with_attachments(db: &PgPool, mut msgs: Vec<Message>) -> ApiResult<Vec<Message>> {
+    let ids: Vec<i64> = msgs.iter().map(|m| m.id.0 as i64).collect();
+    let mut map = crate::attachments::for_messages(db, &ids).await?;
+    for m in &mut msgs {
+        if let Some(a) = map.remove(&(m.id.0 as i64)) {
+            m.attachments = a;
+        }
+    }
+    Ok(msgs)
 }
 
 fn validate_content(content: &str) -> ApiResult<String> {
@@ -51,7 +65,8 @@ async fn load(db: &PgPool, channel_id: Snowflake, id: Snowflake) -> ApiResult<Me
         .bind(channel_id.0 as i64)
         .fetch_optional(db)
         .await?;
-    row.map(message_from_row).ok_or(AppError::NotFound("сообщение"))
+    let m = row.map(message_from_row).ok_or(AppError::NotFound("сообщение"))?;
+    Ok(with_attachments(db, vec![m]).await?.remove(0))
 }
 
 #[derive(Deserialize)]
@@ -76,7 +91,7 @@ pub async fn history(
         .bind(limit)
         .fetch_all(&st.db)
         .await?;
-    Ok(Json(rows.into_iter().map(message_from_row).collect()))
+    Ok(Json(with_attachments(&st.db, rows.into_iter().map(message_from_row).collect()).await?))
 }
 
 pub async fn send(
@@ -93,19 +108,28 @@ pub async fn send(
     if !access.can_write() {
         return Err(AppError::BadRequest("not_text_channel", "писать можно только в текстовый канал".into()));
     }
-    let content = validate_content(&req.content)?;
+    // Подпись к картинке необязательна: можно отправить только вложения
+    let content = if req.attachment_ids.is_empty() || !req.content.trim().is_empty() {
+        validate_content(&req.content)?
+    } else {
+        String::new()
+    };
     if req.nonce.as_ref().is_some_and(|n| n.len() > MAX_NONCE) {
         return Err(AppError::BadRequest("bad_nonce", format!("nonce: до {MAX_NONCE} байт")));
     }
     let id = st.ids.next();
+    let mut tx = st.db.begin().await?;
     sqlx::query("INSERT INTO messages (id, channel_id, author_id, content, reply_to_id) VALUES ($1, $2, $3, $4, $5)")
         .bind(id.0 as i64)
         .bind(channel_id.0 as i64)
         .bind(user.id().0 as i64)
         .bind(&content)
         .bind(req.reply_to_id.map(|r| r.0 as i64))
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+    // В той же транзакции: если вложение чужое или уже отправлено — сообщение не создаётся
+    let attachments = crate::attachments::attach(&mut *tx, &req.attachment_ids, id, channel_id, user.id()).await?;
+    tx.commit().await?;
     // Своё сообщение считается прочитанным: иначе канал «загорится» на других устройствах автора
     mark_read(&st.db, user.id(), channel_id, id).await?;
     let message = Message {
@@ -116,6 +140,7 @@ pub async fn send(
         reply_to_id: req.reply_to_id,
         edited_at: None,
         nonce: req.nonce,
+        attachments,
     };
     access.publish(&st.bus, Event::MessageCreate(message.clone()));
     Ok((StatusCode::CREATED, Json(message)))
@@ -159,6 +184,8 @@ pub async fn delete(
         return Err(AppError::Forbidden);
     }
     sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id.0 as i64).execute(&st.db).await?;
+    let files: Vec<i64> = message.attachments.iter().map(|a| a.id.0 as i64).collect();
+    crate::attachments::remove_files(&st, &files).await;
     access.publish(&st.bus, Event::MessageDelete { id: message_id, channel_id });
     Ok(StatusCode::NO_CONTENT)
 }

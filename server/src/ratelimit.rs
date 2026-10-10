@@ -23,6 +23,8 @@ pub struct Rule {
 pub const AUTH: Rule = Rule { burst: 10.0, per_sec: 10.0 / 60.0 };
 /// «Печатает»: клиент шлёт раз в 8 с; с запасом — 3 подряд, затем раз в 3 с
 pub const TYPING: Rule = Rule { burst: 3.0, per_sec: 1.0 / 3.0 };
+/// Загрузки файлов: 5 подряд, затем одна в 3 с
+pub const UPLOADS: Rule = Rule { burst: 5.0, per_sec: 1.0 / 3.0 };
 /// Сообщения: 5 подряд, дальше одно в секунду
 pub const MESSAGES: Rule = Rule { burst: 5.0, per_sec: 1.0 };
 

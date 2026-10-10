@@ -37,6 +37,8 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       # Сервер за Caddy: настоящий IP клиента — в X-Forwarded-For (для лимитов частоты)
       FEATHER_TRUST_PROXY: "1"
+    volumes:
+      - files:/data   # вложения
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,3 +70,4 @@ services:
 volumes:
   pgdata:
   caddy_data:
+  files:
