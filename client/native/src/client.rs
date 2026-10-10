@@ -9,14 +9,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use feather_core::{Api, GatewayEvent, GatewayHandle};
+use feather_core::{Api, GatewayEvent, GatewayHandle, VoiceEvent, VoiceOptions, VoicePeer, VoiceSession};
 use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, Event, Guild, Message, Snowflake, User};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::session::{self, Session};
 use crate::util::{initial, time_label, user_color};
-use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg};
+use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, VoiceMember};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const HISTORY_LIMIT: u32 = 100;
@@ -140,6 +140,9 @@ fn wire_callbacks(ui: &AppWindow) {
     }));
     ui.on_send(|text| post(move |app| app.send(text.trim().to_owned())));
     ui.on_load_older(|| post(|app| app.load_older()));
+    ui.on_toggle_mute(|| post(|app| app.toggle_mute()));
+    ui.on_toggle_deafen(|| post(|app| app.toggle_deafen()));
+    ui.on_leave_voice(|| post(|app| app.leave_voice()));
     ui.on_logout(|| post(|app| app.logout()));
     ui.on_invite(|| post(|app| app.invite()));
 
@@ -184,6 +187,32 @@ fn msg_row(prev: Option<&Message>, m: &Message) -> Msg {
     }
 }
 
+/// Голосовой канал, в котором мы сейчас
+struct Voice {
+    channel: Snowflake,
+    channel_name: String,
+    /// None — ещё подключаемся
+    session: Option<VoiceSession>,
+    me: String,
+    peers: Vec<VoicePeer>,
+    speaking: Vec<String>,
+    muted: bool,
+    deafened: bool,
+    /// Номер подключения: события старой сессии после переподключения игнорируем
+    id: u64,
+}
+
+/// Настройки голоса из окружения (настройки в интерфейсе — следующий шаг):
+/// FEATHER_MIC / FEATHER_SPEAKER — подстрока имени устройства, FEATHER_NO_RNNOISE, FEATHER_NO_AEC
+fn voice_options() -> VoiceOptions {
+    VoiceOptions {
+        noise_suppression: std::env::var_os("FEATHER_NO_RNNOISE").is_none(),
+        echo_cancellation: std::env::var_os("FEATHER_NO_AEC").is_none(),
+        input_device: std::env::var("FEATHER_MIC").ok(),
+        output_device: std::env::var("FEATHER_SPEAKER").ok(),
+    }
+}
+
 struct App {
     ui: Weak<AppWindow>,
     rt: Handle,
@@ -206,6 +235,8 @@ struct App {
     /// Идёт подгрузка старых сообщений / в канале есть ещё более старые
     loading_older: bool,
     has_older: bool,
+    voice: Option<Voice>,
+    voice_seq: u64,
 }
 
 impl App {
@@ -242,6 +273,8 @@ impl App {
             load_gen: 0,
             loading_older: false,
             has_older: false,
+            voice: None,
+            voice_seq: 0,
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
     }
@@ -294,14 +327,48 @@ impl App {
                     Kind::Voice => ChannelKind::Voice,
                     Kind::Category => ChannelKind::Category,
                 },
-                active: Some(c.id) == self.channel,
+                active: Some(c.id) == self.channel || self.voice.as_ref().is_some_and(|v| v.channel == c.id),
                 unread: self.unread.contains_key(&c.id),
+                voice_members: self.voice_members(c.id),
             })
             .collect();
         ui.set_channels(ModelRc::new(VecModel::from(items)));
         let current = self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id));
         ui.set_channel_name(current.map(|c| c.name.clone()).unwrap_or_default().into());
         ui.set_can_write(current.is_some_and(|c| c.kind == Kind::Text));
+    }
+
+    fn voice_members(&self, channel: Snowflake) -> ModelRc<VoiceMember> {
+        let Some(v) = self.voice.as_ref().filter(|v| v.channel == channel) else { return ModelRc::default() };
+        let me = VoicePeer { identity: v.me.clone(), name: self.me.username.clone() };
+        let rows: Vec<VoiceMember> = std::iter::once(&me)
+            .chain(v.peers.iter())
+            .map(|p| {
+                let id = p.identity.parse().map(Snowflake).unwrap_or(Snowflake(0));
+                VoiceMember {
+                    name: p.name.as_str().into(),
+                    initial: initial(&p.name),
+                    tint: user_color(id),
+                    speaking: v.speaking.contains(&p.identity),
+                    muted: p.identity == v.me && (v.muted || v.deafened),
+                }
+            })
+            .collect();
+        ModelRc::new(VecModel::from(rows))
+    }
+
+    fn refresh_voice(&self) {
+        let Some(ui) = self.ui() else { return };
+        match &self.voice {
+            Some(v) => {
+                ui.set_voice_channel(v.channel_name.as_str().into());
+                ui.set_voice_state(if v.session.is_some() { "Голос подключён" } else { "Подключение…" }.into());
+                ui.set_voice_muted(v.muted || v.deafened);
+                ui.set_voice_deafened(v.deafened);
+            }
+            None => ui.set_voice_channel(SharedString::new()),
+        }
+        self.refresh_channels();
     }
 
     fn refresh_members(&self) {
@@ -364,6 +431,12 @@ impl App {
                         let remembered = session::load()
                             .and_then(|s| s.last_channels.get(&id.to_string()).cloned())
                             .and_then(|cid| app.channels.iter().find(|c| c.id.to_string() == cid && c.kind == Kind::Text).cloned());
+                        // Для автотестов: FEATHER_AUTOJOIN_VOICE=1 сразу заходит в первый голосовой канал
+                        if std::env::var_os("FEATHER_AUTOJOIN_VOICE").is_some()
+                            && let Some(vc) = app.channels.iter().find(|c| c.kind == Kind::Voice).cloned()
+                        {
+                            app.join_voice(&vc);
+                        }
                         if let Some(first) = remembered.or_else(|| app.channels.iter().find(|c| c.kind == Kind::Text).cloned()) {
                             app.select_channel(&first);
                         } else {
@@ -380,7 +453,7 @@ impl App {
         match c.kind {
             Kind::Category => return,
             Kind::Voice => {
-                self.set_status("Голосовые каналы появятся на этапе 2");
+                self.join_voice(c);
                 return;
             }
             Kind::Text => {}
@@ -644,6 +717,118 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ голос
+
+    fn join_voice(&mut self, c: &Channel) {
+        if self.voice.as_ref().is_some_and(|v| v.channel == c.id) {
+            return;
+        }
+        self.leave_voice();
+        self.voice_seq += 1;
+        let id = self.voice_seq;
+        self.voice = Some(Voice {
+            channel: c.id,
+            channel_name: c.name.clone(),
+            session: None,
+            me: self.me.id.to_string(),
+            peers: Vec::new(),
+            speaking: Vec::new(),
+            // FEATHER_START_MUTED=1 — заходить с выключенным микрофоном
+            muted: std::env::var_os("FEATHER_START_MUTED").is_some(),
+            deafened: false,
+            id,
+        });
+        self.refresh_voice();
+        let (api, channel) = (self.api.clone(), c.id);
+        self.rt.spawn(async move {
+            let joined = match api.voice_join(channel).await {
+                Ok(j) => VoiceSession::join(&j.url, &j.token, voice_options(), move |ev| post(move |app| app.on_voice(id, ev))).await,
+                Err(e) => Err(e.to_string()),
+            };
+            post(move |app| {
+                let current = app.voice.as_mut().filter(|v| v.id == id);
+                match (joined, current) {
+                    (Ok(session), Some(v)) => {
+                        session.set_muted(v.muted);
+                        session.set_deafened(v.deafened);
+                        v.session = Some(session);
+                        app.refresh_voice();
+                    }
+                    // Пользователь уже ушёл из канала, пока мы подключались
+                    (Ok(session), None) => {
+                        app.rt.spawn(session.leave());
+                    }
+                    (Err(e), _) => {
+                        if app.voice.as_ref().is_some_and(|v| v.id == id) {
+                            app.voice = None;
+                            app.refresh_voice();
+                        }
+                        app.set_status(format!("Голос: {e}"));
+                    }
+                }
+            });
+        });
+    }
+
+    fn on_voice(&mut self, id: u64, ev: VoiceEvent) {
+        let Some(v) = self.voice.as_mut().filter(|v| v.id == id) else { return };
+        match ev {
+            VoiceEvent::Joined { me, peers } => {
+                v.me = me;
+                v.peers = peers;
+            }
+            VoiceEvent::PeerJoined(p) => {
+                v.peers.retain(|x| x.identity != p.identity);
+                v.peers.push(p);
+            }
+            VoiceEvent::PeerLeft(identity) => v.peers.retain(|x| x.identity != identity),
+            VoiceEvent::Speaking(who) => v.speaking = who,
+            VoiceEvent::Warning(w) => {
+                self.set_status(w);
+                return;
+            }
+            VoiceEvent::Disconnected(reason) => {
+                self.voice = None;
+                self.set_status(format!("Голос отключён ({reason})"));
+            }
+        }
+        self.refresh_voice();
+    }
+
+    fn toggle_mute(&mut self) {
+        let Some(v) = self.voice.as_mut() else { return };
+        // Как в Discord: включение микрофона снимает и «выключенный звук»
+        if v.deafened {
+            v.deafened = false;
+            v.muted = false;
+        } else {
+            v.muted = !v.muted;
+        }
+        if let Some(s) = &v.session {
+            s.set_muted(v.muted);
+            s.set_deafened(v.deafened);
+        }
+        self.refresh_voice();
+    }
+
+    fn toggle_deafen(&mut self) {
+        let Some(v) = self.voice.as_mut() else { return };
+        v.deafened = !v.deafened;
+        if let Some(s) = &v.session {
+            s.set_deafened(v.deafened);
+        }
+        self.refresh_voice();
+    }
+
+    fn leave_voice(&mut self) {
+        if let Some(v) = self.voice.take()
+            && let Some(session) = v.session
+        {
+            self.rt.spawn(session.leave());
+        }
+        self.refresh_voice();
+    }
+
     // ------------------------------------------------------------ серверы, инвайты, выход
 
     fn invite(&self) {
@@ -690,6 +875,7 @@ impl App {
     }
 
     fn logout(&mut self) {
+        self.leave_voice();
         let api = self.api.clone();
         self.rt.spawn(async move {
             let _ = api.logout().await;

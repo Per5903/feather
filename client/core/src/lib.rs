@@ -3,6 +3,8 @@
 
 pub mod api;
 pub mod gateway;
+pub mod voice;
 
 pub use api::{Api, Error};
 pub use gateway::{GatewayEvent, GatewayHandle};
+pub use voice::{VoiceEvent, VoiceOptions, VoicePeer, VoiceSession};

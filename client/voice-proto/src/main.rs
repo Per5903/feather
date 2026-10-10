@@ -48,7 +48,8 @@ fn token(identity: &str) -> String {
         .unwrap_or_else(|_| "dev_secret_change_me_at_least_32_chars_long".into());
     AccessToken::with_api_key(&key, &secret)
         .with_identity(identity)
-        .with_grants(VideoGrants { room_join: true, room: ROOM.into(), ..Default::default() })
+        // FEATHER_ROOM — зайти в комнату голосового канала Feather (voice:<id канала>)
+        .with_grants(VideoGrants { room_join: true, room: std::env::var("FEATHER_ROOM").unwrap_or_else(|_| ROOM.into()), ..Default::default() })
         .to_jwt()
         .expect("не удалось подписать токен")
 }
@@ -277,6 +278,10 @@ async fn record_mode(path: String, seconds: u64) {
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             if let RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(t), participant, .. } = ev {
+                // FEATHER_RECORD_IDENTITY — писать только этого участника
+                if std::env::var("FEATHER_RECORD_IDENTITY").is_ok_and(|want| participant.identity().as_str() != want) {
+                    continue;
+                }
                 println!("записываю {}", participant.identity());
                 let mut stream = NativeAudioStream::new(t.rtc_track(), SAMPLE_RATE as i32, 1);
                 while let Some(frame) = stream.next().await {

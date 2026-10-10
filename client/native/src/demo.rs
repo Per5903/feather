@@ -82,7 +82,7 @@ pub fn run(ui: &AppWindow) -> Vec<Timer> {
         guild("WoW", false),
         guild("CS", false),
     ])));
-    let ch = |name: &str, kind, active| ChannelItem { name: name.into(), kind, active, unread: false };
+    let ch = |name: &str, kind, active| ChannelItem { name: name.into(), kind, active, unread: false, voice_members: Default::default() };
     ui.set_channels(ModelRc::new(VecModel::from(vec![
         ch("ТЕКСТОВЫЕ", ChannelKind::Category, false),
         ch("общий", ChannelKind::Text, true),

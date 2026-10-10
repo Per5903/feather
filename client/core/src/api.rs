@@ -144,6 +144,11 @@ impl Api {
         self.call::<(), _>(Method::GET, &path, None).await
     }
 
+    /// Токен LiveKit для входа в голосовой канал
+    pub async fn voice_join(&self, channel: Snowflake) -> Result<VoiceJoinResponse> {
+        self.call::<(), _>(Method::POST, &format!("/channels/{channel}/voice/join"), None).await
+    }
+
     /// «Дочитал канал до этого сообщения»
     pub async fn ack(&self, channel: Snowflake, message: Snowflake) -> Result<()> {
         self.call(Method::POST, &format!("/channels/{channel}/ack"), Some(&AckRequest { message_id: message })).await

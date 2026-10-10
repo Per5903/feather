@@ -33,11 +33,21 @@ export struct GuildItem {
 
 export enum ChannelKind { text, voice, category }
 
+export struct VoiceMember {
+    name: string,
+    initial: string,
+    tint: color,
+    speaking: bool,
+    muted: bool,
+}
+
 export struct ChannelItem {
     name: string,
     kind: ChannelKind,
     active: bool,
     unread: bool,
+    /// Кто сидит в голосовом канале (пока видно только своему каналу)
+    voice-members: [VoiceMember],
 }
 
 global Theme {
@@ -169,41 +179,77 @@ component MessageRow inherits Rectangle {
     }
 }
 
-component ChannelRow inherits Rectangle {
+component ChannelRow inherits VerticalLayout {
     in property <ChannelItem> c;
     callback clicked();
-    property <bool> lit: c.active || c.unread || cta.has-hover;
-    height: c.kind == ChannelKind.category ? 30px : 32px;
-    border-radius: 4px;
-    background: c.kind == ChannelKind.category ? transparent : c.active ? Theme.active : cta.has-hover ? Theme.hover : transparent;
-    cta := TouchArea { clicked => { root.clicked(); } }
-    // Метка непрочитанного слева, как в Discord
-    if c.unread && !c.active: Rectangle {
-        x: -8px;
-        y: (parent.height - self.height) / 2;
-        width: 4px;
-        height: 8px;
-        border-radius: 2px;
-        background: Theme.text;
+    Rectangle {
+        property <bool> lit: c.active || c.unread || cta.has-hover;
+        height: c.kind == ChannelKind.category ? 30px : 32px;
+        border-radius: 4px;
+        background: c.kind == ChannelKind.category ? transparent : c.active ? Theme.active : cta.has-hover ? Theme.hover : transparent;
+        cta := TouchArea { clicked => { root.clicked(); } }
+        // Метка непрочитанного слева, как в Discord
+        if c.unread && !c.active: Rectangle {
+            x: -8px;
+            y: (parent.height - self.height) / 2;
+            width: 4px;
+            height: 8px;
+            border-radius: 2px;
+            background: Theme.text;
+        }
+        HorizontalLayout {
+            padding-left: 8px;
+            spacing: 6px;
+            if c.kind == ChannelKind.voice: VerticalLayout {
+                alignment: center;
+                Icon {
+                    width: 14px;
+                    height: 14px;
+                    commands: "M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z";
+                    fill: lit ? Theme.text : Theme.dim;
+                }
+            }
+            Text {
+                text: c.kind == ChannelKind.text ? "# " + c.name : c.name;
+                color: c.kind == ChannelKind.category ? Theme.dim : lit ? Theme.text : Theme.dim;
+                font-size: c.kind == ChannelKind.category ? 12px : 15px;
+                font-weight: c.kind == ChannelKind.category || c.unread ? 600 : 400;
+                vertical-alignment: c.kind == ChannelKind.category ? bottom : center;
+            }
+        }
     }
-    HorizontalLayout {
-        padding-left: 8px;
-        spacing: 6px;
-        if c.kind == ChannelKind.voice: VerticalLayout {
+    for m in c.voice-members: HorizontalLayout {
+        height: 30px;
+        padding-left: 28px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Avatar {
+                size: 24px;
+                initial: m.initial;
+                tint: m.tint;
+                // Зелёное кольцо — человек говорит
+                border-width: m.speaking ? 2px : 0px;
+                border-color: #3ba55c;
+            }
+        }
+        Text {
+            text: m.name;
+            color: m.speaking ? Theme.text : Theme.dim;
+            font-size: 14px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if m.muted: VerticalLayout {
             alignment: center;
             Icon {
                 width: 14px;
                 height: 14px;
-                commands: "M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z";
-                fill: lit ? Theme.text : Theme.dim;
+                // Перечёркнутый микрофон
+                commands: "M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z";
+                fill: Theme.danger;
             }
-        }
-        Text {
-            text: c.kind == ChannelKind.text ? "# " + c.name : c.name;
-            color: c.kind == ChannelKind.category ? Theme.dim : lit ? Theme.text : Theme.dim;
-            font-size: c.kind == ChannelKind.category ? 12px : 15px;
-            font-weight: c.kind == ChannelKind.category || c.unread ? 600 : 400;
-            vertical-alignment: c.kind == ChannelKind.category ? bottom : center;
         }
     }
 }
@@ -382,6 +428,16 @@ export component AppWindow inherits Window {
     /// Долистали до начала ленты: пора подгрузить сообщения постарше
     callback load-older();
     callback select-guild(int);
+
+    // ---- голос
+    /// Название голосового канала, к которому подключены; "" — не подключены
+    in property <string> voice-channel;
+    in property <string> voice-state;
+    in property <bool> voice-muted;
+    in property <bool> voice-deafened;
+    callback toggle-mute();
+    callback toggle-deafen();
+    callback leave-voice();
     callback select-channel(int);
     callback send(string);
     callback create-guild-dialog();
@@ -535,13 +591,47 @@ export component AppWindow inherits Window {
                         clicked => { root.select-channel(i); }
                     }
                 }
+                if voice-channel != "": Rectangle {
+                    height: 56px;
+                    background: Theme.bg0;
+                    Rectangle { y: 0; height: 1px; background: Theme.border; }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 8px;
+                        spacing: 4px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: voice-state;
+                                color: voice-state == "Голос подключён" ? #3ba55c : #faa61a;
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: voice-channel;
+                                color: Theme.dim;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Отключиться: трубка
+                                icon: "M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z";
+                                clicked => { root.leave-voice(); }
+                            }
+                        }
+                    }
+                }
                 Rectangle {
                     height: 52px;
                     background: Theme.bg0;
                     HorizontalLayout {
                         padding-left: 8px;
                         padding-right: 8px;
-                        spacing: 8px;
+                        spacing: 4px;
                         VerticalLayout {
                             alignment: center;
                             Avatar { size: 32px; initial: me-initial; tint: me-tint; }
@@ -554,6 +644,26 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             overflow: elide;
                             horizontal-stretch: 1;
+                        }
+                        if voice-channel != "": VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Микрофон: обычный или перечёркнутый
+                                icon: voice-muted
+                                    ? "M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"
+                                    : "M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z";
+                                clicked => { root.toggle-mute(); }
+                            }
+                        }
+                        if voice-channel != "": VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Звук: наушники
+                                icon: voice-deafened
+                                    ? "M12 4c-3.87 0-7 3.13-7 7v.17l2 2V11c0-2.76 2.24-5 5-5s5 2.24 5 5v1.17l1.97 1.97c.02-.17.03-.33.03-.5V11c0-3.87-3.13-7-7-7zM3.27 2.5L2 3.77l3 3C4.38 7.98 4 9.45 4 11v7c0 1.66 1.34 3 3 3h3v-8H6v-2c0-.82.21-1.6.57-2.29l10.77 10.77c-.34.31-.79.52-1.34.52h-3v2h3c1.07 0 2.04-.43 2.75-1.12l1.48 1.48L22.5 21.23 3.27 2.5z"
+                                    : "M12 3c-4.97 0-9 4.03-9 9v7c0 1.1.9 2 2 2h4v-8H5v-1c0-3.87 3.13-7 7-7s7 3.13 7 7v1h-4v8h4c1.1 0 2-.9 2-2v-7c0-4.97-4.03-9-9-9z";
+                                clicked => { root.toggle-deafen(); }
+                            }
                         }
                         VerticalLayout {
                             alignment: center;

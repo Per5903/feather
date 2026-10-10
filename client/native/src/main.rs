@@ -14,6 +14,13 @@ use slint::{ComponentHandle, Timer, TimerMode};
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
+    // WebRTC при подключении проверяет видеодекодер NVIDIA и поднимает контекст CUDA:
+    // +80 МБ памяти ради видео, которого в голосе нет (bench/README.md, замер 11).
+    // Аппаратное КОДИРОВАНИЕ для демонстрации экрана это не отключает.
+    if std::env::var_os("LK_DISABLE_NVDEC").is_none() {
+        // SAFETY: в самом начале main, до запуска других потоков
+        unsafe { std::env::set_var("LK_DISABLE_NVDEC", "1") };
+    }
     let ui = AppWindow::new()?;
 
     // Сеть и шлюз живут в tokio; двух потоков чату хватает с запасом (лёгкость — D5)
