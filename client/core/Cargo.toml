@@ -22,4 +22,4 @@ ringbuf = "0.4"
 
 # Глобальный push-to-talk на Linux/Wayland через XDG-портал (D15)
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts", "notification"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts", "notification", "file_chooser"] }

@@ -21,6 +21,11 @@ export struct Msg {
     img-h: length,
     img-label: string,
     img-tint: color,
+    /// Загруженное превью (пока нет — показывается заглушка img-tint)
+    image: image,
+    image-loaded: bool,
+    /// Прочие вложения строками: «имя · размер»
+    files: string,
 }
 
 export struct Member {
@@ -139,6 +144,8 @@ component MessageRow inherits TouchArea {
     in property <Msg> m;
     callback edit();
     callback delete();
+    callback open-image();
+    callback open-files();
     Rectangle { background: m.mention ? #f0b23214 : root.has-hover ? Theme.row-hover : transparent; }
     if m.mention: Rectangle {
         x: 0;
@@ -184,7 +191,7 @@ component MessageRow inherits TouchArea {
                     vertical-alignment: bottom;
                 }
             }
-            Text {
+            if m.text != "" || m.edited: Text {
                 text: m.edited ? m.text + "  (изменено)" : m.text;
                 color: Theme.text;
                 wrap: word-wrap;
@@ -196,8 +203,15 @@ component MessageRow inherits TouchArea {
                     width: m.img-w;
                     height: m.img-h;
                     border-radius: 8px;
-                    background: m.img-tint;
-                    Text {
+                    background: m.image-loaded ? transparent : m.img-tint;
+                    clip: true;
+                    if m.image-loaded: Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: m.image;
+                        image-fit: cover;
+                    }
+                    if !m.image-loaded: Text {
                         width: parent.width;
                         height: parent.height;
                         text: m.img-label;
@@ -206,6 +220,35 @@ component MessageRow inherits TouchArea {
                         font-weight: 600;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.open-image(); }
+                    }
+                }
+            }
+            if m.files != "": fta := TouchArea {
+                mouse-cursor: pointer;
+                height: ftext.preferred-height + 12px;
+                clicked => { root.open-files(); }
+                Rectangle {
+                    border-radius: 6px;
+                    background: fta.has-hover ? Theme.active : Theme.bg1;
+                }
+                HorizontalLayout {
+                    padding: 6px;
+                    padding-left: 10px;
+                    spacing: 8px;
+                    Icon {
+                        y: 2px;
+                        // Скрепка
+                        commands: "M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5a2.5 2.5 0 0 1 5 0v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5a2.5 2.5 0 0 0 5 0V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z";
+                        fill: Theme.accent;
+                    }
+                    ftext := Text {
+                        text: m.files;
+                        color: Theme.accent;
+                        wrap: word-wrap;
                     }
                 }
             }
@@ -834,6 +877,13 @@ export component AppWindow inherits Window {
     callback delete-message(int);
     callback cancel-edit();
     callback typing();
+    // ---- вложения
+    /// Прикреплённые к будущему сообщению файлы: «имя · загрузка…» / «имя · 1,2 МБ»
+    in property <[string]> pending-files;
+    callback attach();
+    callback remove-pending(int);
+    callback open-image(int);
+    callback open-files(int);
     callback create-guild-dialog();
     callback join-guild-dialog();
     callback invite();
@@ -1166,6 +1216,39 @@ export component AppWindow inherits Window {
                         m: m;
                         edit => { root.edit-message(i); }
                         delete => { root.delete-message(i); }
+                        open-image => { root.open-image(i); }
+                        open-files => { root.open-files(i); }
+                    }
+                }
+                if pending-files.length > 0: HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-bottom: 6px;
+                    spacing: 6px;
+                    alignment: start;
+                    for f[i] in pending-files: Rectangle {
+                        height: 26px;
+                        width: chip.preferred-width;
+                        border-radius: 13px;
+                        background: Theme.bg1;
+                        chip := HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            Text { text: f; color: Theme.text; font-size: 12px; vertical-alignment: center; }
+                            Rectangle {
+                                width: 20px;
+                                xta := TouchArea { clicked => { root.remove-pending(i); } }
+                                Text {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: "×";
+                                    color: xta.has-hover ? Theme.danger : Theme.dim;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
                 }
                 if editing: HorizontalLayout {
@@ -1201,9 +1284,16 @@ export component AppWindow inherits Window {
                         background: Theme.hover;
                         border-width: editing ? 1px : 0px;
                         border-color: Theme.accent;
+                        IconButton {
+                            x: 8px;
+                            y: (parent.height - self.height) / 2;
+                            icon: "M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5a2.5 2.5 0 0 1 5 0v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5a2.5 2.5 0 0 0 5 0V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z";
+                            visible: can-write && !editing;
+                            clicked => { root.attach(); }
+                        }
                         input := TextInput {
-                            x: 14px;
-                            width: parent.width - 28px;
+                            x: 42px;
+                            width: parent.width - 56px;
                             height: parent.height;
                             color: Theme.text;
                             vertical-alignment: center;
@@ -1211,14 +1301,14 @@ export component AppWindow inherits Window {
                             text <=> root.composer-text;
                             edited => { root.typing(); }
                             accepted => {
-                                if (self.text != "" && can-write) {
+                                if ((self.text != "" || pending-files.length > 0) && can-write) {
                                     root.send(self.text);
                                     root.composer-text = "";
                                 }
                             }
                         }
                         if input.text == "": Text {
-                            x: 14px;
+                            x: 42px;
                             height: parent.height;
                             text: !can-write ? "Выберите текстовый канал" : in-dm ? "Написать @" + channel-name : "Написать в #" + channel-name;
                             color: Theme.dim;

@@ -5,12 +5,12 @@
 //! возвращают результаты через `post`, который выполняет замыкание в потоке интерфейса.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
 use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, Notifier, VoiceEvent, VoiceOptions, VoiceSession};
-use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, RoleRequest, Snowflake, User, VoiceState, perms};
+use feather_protocol::{Attachment, Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, RoleRequest, Snowflake, User, VoiceState, perms};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
@@ -144,6 +144,10 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_cancel_edit(|| post(|app| app.cancel_edit()));
     ui.on_delete_message(|i| post(move |app| app.ask_delete(i as usize)));
     ui.on_typing(|| post(|app| app.on_local_typing()));
+    ui.on_attach(|| post(|app| app.attach()));
+    ui.on_remove_pending(|i| post(move |app| app.remove_pending(i as usize)));
+    ui.on_open_image(|i| post(move |app| app.open_image(i as usize)));
+    ui.on_open_files(|i| post(move |app| app.open_files(i as usize)));
     ui.on_load_older(|| post(|app| app.load_older()));
     ui.on_toggle_mute(|| post(|app| app.toggle_mute()));
     ui.on_open_settings(|| post(|app| app.open_settings()));
@@ -220,6 +224,29 @@ fn mentions(text: &str, username: &str) -> bool {
     text.match_indices(&needle).any(|(i, _)| {
         text[i + needle.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-'))
     })
+}
+
+/// Первая картинка с превью среди вложений
+fn first_image(m: &Message) -> Option<&Attachment> {
+    m.attachments.iter().find(|a| a.has_thumb)
+}
+
+/// Размер превью в ленте: вписать в 400×300, сохраняя пропорции
+fn preview_size(a: &Attachment) -> (f32, f32) {
+    let (w, h) = (a.width.unwrap_or(400) as f32, a.height.unwrap_or(300) as f32);
+    let k = (400.0 / w).min(300.0 / h).min(1.0);
+    ((w * k).max(40.0), (h * k).max(40.0))
+}
+
+/// Сколько превью держать в памяти (каждое ≤ 400×300 RGB ≈ 360 КБ)
+const THUMB_CACHE: usize = 80;
+const MAX_UPLOAD: u64 = 25 * 1024 * 1024;
+
+/// Файл, прикреплённый к ещё не отправленному сообщению
+struct PendingFile {
+    name: String,
+    size: u64,
+    attachment: Option<Attachment>,
 }
 
 /// «Шторм печатает…», «Шторм и Лиса печатают…», «Несколько человек печатают…»
@@ -312,6 +339,11 @@ struct App {
     /// Окно «Роли»: выбранная роль и выбранный цвет
     role_selected: Option<Snowflake>,
     role_color: usize,
+    /// Превью картинок: кэш (с порядком для вытеснения) и что сейчас грузится
+    thumbs: HashMap<Snowflake, slint::Image>,
+    thumb_order: VecDeque<Snowflake>,
+    thumbs_loading: HashSet<Snowflake>,
+    pending_files: Vec<PendingFile>,
     /// Окно «Роли участника»: участник и роли, показанные в окне
     roles_target: Option<Snowflake>,
     roles_offered: Vec<Snowflake>,
@@ -384,6 +416,10 @@ impl App {
             role_selected: None,
             role_color: 0,
             roles_target: None,
+            thumbs: HashMap::new(),
+            thumb_order: VecDeque::new(),
+            thumbs_loading: HashSet::new(),
+            pending_files: Vec::new(),
             roles_offered: Vec::new(),
             channel: None,
             members: Vec::new(),
@@ -688,10 +724,29 @@ impl App {
 
     fn row_at(&self, i: usize) -> Msg {
         let m = &self.messages[i];
+        let base = msg_row(i.checked_sub(1).map(|p| &self.messages[p]), m, self.me.id, self.moderator());
+        let img = first_image(m);
+        let (img_w, img_h) = img.map(preview_size).unwrap_or((0.0, 0.0));
+        let cached = img.and_then(|a| self.thumbs.get(&a.id));
+        let files = m
+            .attachments
+            .iter()
+            .filter(|a| Some(a.id) != img.map(|i| i.id))
+            .map(|a| format!("{} · {}", a.filename, feather_core::files::human_size(a.size)))
+            .collect::<Vec<_>>()
+            .join("\n");
         Msg {
             mention: m.author.id != self.me.id && mentions(&m.content, &self.me.username),
             tint: self.user_tint(m.author.id),
-            ..msg_row(i.checked_sub(1).map(|p| &self.messages[p]), m, self.me.id, self.moderator())
+            has_image: img.is_some(),
+            img_w,
+            img_h,
+            img_label: img.map(|a| a.filename.as_str()).unwrap_or_default().into(),
+            img_tint: slint::Color::from_rgb_u8(0x2b, 0x2d, 0x31),
+            image: cached.cloned().unwrap_or_default(),
+            image_loaded: cached.is_some(),
+            files: files.into(),
+            ..base
         }
     }
 
@@ -714,19 +769,171 @@ impl App {
         }
     }
 
-    fn rebuild_messages(&self) {
+    fn rebuild_messages(&mut self) {
         let rows: Vec<Msg> = (0..self.messages.len()).map(|i| self.row_at(i)).collect();
         self.model.set_vec(rows);
+        self.request_thumbs();
+    }
+
+    /// Догрузить превью картинок, которых ещё нет в кэше
+    fn request_thumbs(&mut self) {
+        let wanted: Vec<Snowflake> = self
+            .messages
+            .iter()
+            .filter_map(first_image)
+            .map(|a| a.id)
+            .filter(|id| !self.thumbs.contains_key(id) && !self.thumbs_loading.contains(id))
+            .collect();
+        for id in wanted {
+            self.thumbs_loading.insert(id);
+            let api = self.api.clone();
+            self.rt.spawn(async move {
+                // Декодируем в фоне; в поток интерфейса уходит готовый буфер пикселей
+                let decoded = api.download(id, true).await.ok().and_then(|bytes| {
+                    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?.to_rgb8();
+                    Some(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(img.as_raw(), img.width(), img.height()))
+                });
+                post(move |app| app.thumb_loaded(id, decoded));
+            });
+        }
+    }
+
+    fn thumb_loaded(&mut self, id: Snowflake, buffer: Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>) {
+        self.thumbs_loading.remove(&id);
+        let Some(buffer) = buffer else { return };
+        self.thumbs.insert(id, slint::Image::from_rgb8(buffer));
+        self.thumb_order.push_back(id);
+        while self.thumb_order.len() > THUMB_CACHE {
+            if let Some(old) = self.thumb_order.pop_front() {
+                self.thumbs.remove(&old);
+            }
+        }
+        let stick = self.ui().is_some_and(|ui| ui.invoke_near_bottom());
+        for i in 0..self.messages.len() {
+            if first_image(&self.messages[i]).is_some_and(|a| a.id == id) {
+                self.model.set_row_data(i, self.row_at(i));
+            }
+        }
+        if stick {
+            self.scroll_to_bottom_later();
+        }
+    }
+
+    // ------------------------------------------------------------ вложения: отправка и открытие
+
+    fn refresh_pending(&self) {
+        let Some(ui) = self.ui() else { return };
+        let items: Vec<SharedString> = self
+            .pending_files
+            .iter()
+            .map(|f| match &f.attachment {
+                Some(_) => format!("{} · {}", f.name, feather_core::files::human_size(f.size)).into(),
+                None => format!("{} · загрузка…", f.name).into(),
+            })
+            .collect();
+        ui.set_pending_files(ModelRc::new(VecModel::from(items)));
+    }
+
+    fn attach(&mut self) {
+        let Some(channel) = self.channel else { return };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            for path in feather_core::files::pick_files().await {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+                let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+                if size == 0 || size > MAX_UPLOAD {
+                    let n = name.clone();
+                    post(move |app| app.set_status(format!("«{n}»: файл пустой или больше 25 МБ")));
+                    continue;
+                }
+                let n = name.clone();
+                post(move |app| {
+                    app.pending_files.push(PendingFile { name: n, size, attachment: None });
+                    app.refresh_pending();
+                });
+                let res = match tokio::fs::read(&path).await {
+                    Ok(bytes) => api.upload(channel, &name, feather_core::files::content_type(&path), bytes).await,
+                    Err(e) => Err(feather_core::Error::Network(e.to_string())),
+                };
+                post(move |app| {
+                    let slot = app.pending_files.iter().position(|f| f.name == name && f.attachment.is_none());
+                    match (res, slot) {
+                        (Ok(a), Some(i)) => app.pending_files[i].attachment = Some(a),
+                        (Err(e), Some(i)) => {
+                            app.pending_files.remove(i);
+                            app.set_status(format!("«{name}» не загружен: {e}"));
+                        }
+                        _ => {} // файл уже убрали из списка
+                    }
+                    app.refresh_pending();
+                });
+            }
+        });
+    }
+
+    fn remove_pending(&mut self, i: usize) {
+        if i < self.pending_files.len() {
+            self.pending_files.remove(i);
+            self.refresh_pending();
+        }
+    }
+
+    /// Скачать вложения в «Загрузки/Feather» и открыть системной программой
+    fn open_attachments(&self, list: Vec<Attachment>) {
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            let dir = feather_core::files::downloads_dir();
+            if tokio::fs::create_dir_all(&dir).await.is_err() {
+                return;
+            }
+            let mut last = None;
+            for a in list {
+                // id в имени: файлы с одинаковыми названиями не затрут друг друга
+                let path = dir.join(format!("{}-{}", a.id, a.filename));
+                if tokio::fs::metadata(&path).await.is_err() {
+                    match api.download(a.id, false).await {
+                        Ok(bytes) => {
+                            let _ = tokio::fs::write(&path, bytes).await;
+                        }
+                        Err(e) => {
+                            post(move |app| app.set_status(format!("Не удалось скачать: {e}")));
+                            continue;
+                        }
+                    }
+                }
+                last = Some(path);
+            }
+            if let Some(p) = last {
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            }
+        });
+    }
+
+    fn open_image(&self, i: usize) {
+        if let Some(a) = self.messages.get(i).and_then(first_image) {
+            self.open_attachments(vec![a.clone()]);
+        }
+    }
+
+    fn open_files(&self, i: usize) {
+        if let Some(m) = self.messages.get(i) {
+            let img = first_image(m).map(|a| a.id);
+            self.open_attachments(m.attachments.iter().filter(|a| Some(a.id) != img).cloned().collect());
+        }
     }
 
     fn scroll_to_bottom_later(&self) {
-        // После изменения модели ListView пересчитывает высоту на следующем кадре
-        let weak = self.ui.clone();
-        Timer::single_shot(Duration::from_millis(20), move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.invoke_scroll_to_bottom();
-            }
-        });
+        // ListView узнаёт настоящие высоты строк (картинки, перенос текста) только после
+        // отрисовки, поэтому прокручиваем дважды: сразу после кадра и после уточнения высот
+        for delay in [20, 150] {
+            let weak = self.ui.clone();
+            Timer::single_shot(Duration::from_millis(delay), move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_scroll_to_bottom();
+                }
+            });
+        }
     }
 
     // ------------------------------------------------------------ навигация
@@ -802,6 +1009,8 @@ impl App {
         self.typing.clear();
         self.refresh_typing();
         self.cancel_edit();
+        self.pending_files.clear();
+        self.refresh_pending();
         self.channel = Some(c.id);
         if c.kind == Kind::Dm {
             // В личке справа — собеседник и я
@@ -893,6 +1102,7 @@ impl App {
                 for (i, row) in rows.into_iter().take(added).enumerate() {
                     app.model.insert(i, row);
                 }
+                app.request_thumbs();
                 if added < app.messages.len() {
                     app.model.set_row_data(added, first_old);
                 }
@@ -924,6 +1134,7 @@ impl App {
             self.messages.push(m);
             let row = self.row_at(self.messages.len() - 1);
             self.model.push(row);
+            self.request_thumbs();
         }
         if stick {
             self.scroll_to_bottom_later();
@@ -1196,7 +1407,7 @@ impl App {
 
     fn send(&mut self, text: String) {
         let Some(channel) = self.channel else { return };
-        if text.is_empty() {
+        if text.is_empty() && self.pending_files.is_empty() {
             return;
         }
         if let Some(id) = self.editing.take() {
@@ -1220,10 +1431,19 @@ impl App {
             return;
         }
         self.last_typing_sent = None; // после отправки следующий набор снова сообщаем сразу
+        if self.pending_files.iter().any(|f| f.attachment.is_none()) {
+            self.set_status("Дождитесь окончания загрузки файлов");
+            if let Some(ui) = self.ui() {
+                ui.set_composer_text(text.as_str().into()); // текст не теряем
+            }
+            return;
+        }
+        let ids: Vec<Snowflake> = self.pending_files.drain(..).filter_map(|f| f.attachment.map(|a| a.id)).collect();
+        self.refresh_pending();
         let nonce = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
         let api = self.api.clone();
         self.rt.spawn(async move {
-            let res = api.send_message(channel, &text, nonce).await;
+            let res = api.send_with_attachments(channel, &text, nonce, ids).await;
             post(move |app| match res {
                 // Ответ сервера добавляем сразу: не ждём шлюз (и работаем, даже если он переподключается)
                 Ok(m) if app.channel == Some(m.channel_id) => app.add_message(m),

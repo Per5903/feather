@@ -333,6 +333,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "serde",
+ "serde_repr",
  "tokio",
  "zbus",
 ]
@@ -2383,6 +2384,7 @@ dependencies = [
  "chrono",
  "feather-core",
  "feather-protocol",
+ "image",
  "png 0.18.1",
  "serde",
  "serde_json",

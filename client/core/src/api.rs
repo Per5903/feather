@@ -204,7 +204,44 @@ impl Api {
     }
 
     pub async fn send_message(&self, channel: Snowflake, content: &str, nonce: String) -> Result<Message> {
-        let req = SendMessageRequest { content: content.into(), nonce: Some(nonce), ..Default::default() };
+        self.send_with_attachments(channel, content, nonce, Vec::new()).await
+    }
+
+    pub async fn send_with_attachments(&self, channel: Snowflake, content: &str, nonce: String, attachments: Vec<Snowflake>) -> Result<Message> {
+        let req = SendMessageRequest { content: content.into(), nonce: Some(nonce), attachment_ids: attachments, ..Default::default() };
         self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(&req)).await
+    }
+
+    /// Загрузить файл в канал (до отправки сообщения)
+    pub async fn upload(&self, channel: Snowflake, filename: &str, content_type: &str, bytes: Vec<u8>) -> Result<Attachment> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/v1/channels/{channel}/attachments", self.base)).map_err(|e| Error::Network(e.to_string()))?;
+        url.query_pairs_mut().append_pair("filename", filename);
+        let mut req = self.http.post(url).header("content-type", content_type).body(bytes).timeout(std::time::Duration::from_secs(120));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
+        if status.is_success() {
+            return serde_json::from_slice(&body).map_err(|e| Error::Network(e.to_string()));
+        }
+        let err: ApiError = serde_json::from_slice(&body).unwrap_or(ApiError { code: "http".into(), message: format!("ошибка сервера {status}") });
+        Err(Error::Api { status: status.as_u16(), code: err.code, message: err.message })
+    }
+
+    /// Скачать вложение (`thumb` — уменьшенную копию картинки)
+    pub async fn download(&self, id: Snowflake, thumb: bool) -> Result<Vec<u8>> {
+        let path = if thumb { format!("/attachments/{id}/thumb") } else { format!("/attachments/{id}") };
+        let mut req = self.http.get(format!("{}/api/v1{path}", self.base)).timeout(std::time::Duration::from_secs(120));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api { status: status.as_u16(), code: "http".into(), message: format!("файл недоступен ({status})") });
+        }
+        Ok(resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?.to_vec())
     }
 }

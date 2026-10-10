@@ -63,6 +63,7 @@ impl Feed {
             img_h,
             img_label: m.image.as_ref().map(|i| format!("{}×{}", i.w, i.h)).unwrap_or_default().into(),
             img_tint: color(m.image.as_ref().map_or(0, |i| i.color)),
+            ..Default::default()
         }
     }
 }

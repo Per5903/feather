@@ -2,6 +2,7 @@
 //! UI (Slint) вызывает методы [`Api`] и получает события шлюза через колбэк.
 
 pub mod api;
+pub mod files;
 pub mod gateway;
 pub mod hotkey;
 pub mod notify;
