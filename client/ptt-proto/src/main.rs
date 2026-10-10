@@ -5,11 +5,12 @@
 //! назначения клавиши и потом присылает события «нажата»/«отпущена» даже поверх игры.
 //!
 //! Запуск: cargo run -p feather-ptt-proto
-//! Первый запуск: KDE покажет окно подтверждения сочетания клавиш.
+//! Первый запуск: KDE покажет окно подтверждения; клавишу нужно выбрать в нём или в
+//! открывшихся после настройках (KDE не назначает предложенную приложением клавишу сам).
 
 use std::time::{Duration, Instant};
 
-use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, NewShortcut};
+use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, ConfigureShortcutsOptions, GlobalShortcuts, NewShortcut};
 use ashpd::desktop::CreateSessionOptions;
 use futures_util::StreamExt;
 
@@ -50,8 +51,17 @@ async fn main() -> ashpd::Result<()> {
         .bind_shortcuts(&session, &[shortcut], None, BindShortcutsOptions::default())
         .await?
         .response()?;
+    let mut unassigned = false;
     for s in bound.shortcuts() {
-        println!("назначено: {} → {}", s.id(), s.trigger_description());
+        let trigger = s.trigger_description();
+        println!("назначено: {} → {}", s.id(), if trigger.is_empty() { "клавиша не выбрана" } else { trigger });
+        unassigned |= trigger.is_empty();
+    }
+    // KDE не применяет предложенную клавишу сам: её выбирает пользователь.
+    // Если клавиши нет — открываем системное окно настройки (портал v2).
+    if unassigned && portal.version() >= 2 {
+        println!("открываю окно настройки клавиши: назначьте её и закройте окно");
+        portal.configure_shortcuts(&session, None, ConfigureShortcutsOptions::default()).await?;
     }
 
     let mut pressed = portal.receive_activated().await?;

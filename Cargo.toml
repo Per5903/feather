@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/protocol", "server", "client/desktop", "client/native", "client/voice-proto", "client/ptt-proto"]
+members = ["bench/denoise", "crates/protocol", "server", "client/desktop", "client/native", "client/voice-proto", "client/ptt-proto"]
 
 # Релизная сборка оптимизирована по размеру: клиент должен быть лёгким
 [profile.release]

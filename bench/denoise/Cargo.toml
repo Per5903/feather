@@ -1,0 +1,10 @@
+[package]
+name = "feather-denoise-bench"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Сравнение шумодавов на записи: качество (на слух) и цена по CPU"
+
+[dependencies]
+nnnoiseless = "0.5"
+hound = "3.5"
