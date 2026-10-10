@@ -32,6 +32,9 @@ async fn serve() {
         .init();
     let cfg = Config::from_env();
     let bind = cfg.bind;
+    if !bind.ip().is_loopback() && cfg.livekit_api_secret.starts_with("dev_secret") {
+        tracing::warn!("ВНИМАНИЕ: тестовый секрет LiveKit на открытом адресе — задайте LIVEKIT_API_SECRET (deploy/selfhost/setup.sh)");
+    }
     let app = build(cfg).await.expect("не удалось подключиться к БД или применить миграции");
     let listener = tokio::net::TcpListener::bind(bind).await.expect("не удалось открыть порт");
     tracing::info!("feather-server слушает http://{bind}");

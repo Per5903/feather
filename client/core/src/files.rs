@@ -107,8 +107,8 @@ mod tests {
     #[test]
     fn uri_decoding() {
         assert_eq!(
-            file_uri_to_path("file:///home/per/%D0%A1%D0%BA%D1%80%D0%B8%D0%BD%201.png"),
-            Some(PathBuf::from("/home/per/Скрин 1.png"))
+            file_uri_to_path("file:///home/user/%D0%A1%D0%BA%D1%80%D0%B8%D0%BD%201.png"),
+            Some(PathBuf::from("/home/user/Скрин 1.png"))
         );
         assert_eq!(file_uri_to_path("https://x"), None);
     }
