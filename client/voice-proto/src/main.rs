@@ -252,6 +252,11 @@ async fn device_mode(name: String) {
         )
         .await
         .expect("не удалось опубликовать микрофон");
+    // Как при отпущенной кнопке push-to-talk: захват микрофона и кодирование остановлены
+    if std::env::var_os("FEATHER_PTT_RELEASED").is_some() {
+        audio.stop_recording().expect("не удалось остановить запись");
+        println!("{name}: PTT отпущен, запись остановлена");
+    }
     println!("{name}: в канале");
     // Чужие треки в режиме PlatformAudio воспроизводятся устройством автоматически
     while let Some(ev) = events.recv().await {

@@ -12,3 +12,4 @@ bench/results/*.json
 client/desktop/gen/
 bench/audio/src/
 bench/audio/*.wav
+bench/audio/street_*
