@@ -19,3 +19,7 @@ livekit = { version = "0.9", features = ["rustls-tls-native-roots"] }
 cpal = { version = "0.18", features = ["pulseaudio"] }
 nnnoiseless = "0.5"
 ringbuf = "0.4"
+
+# Глобальный push-to-talk на Linux/Wayland через XDG-портал (D15)
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }

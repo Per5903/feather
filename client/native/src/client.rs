@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use feather_core::{Api, GatewayEvent, GatewayHandle, VoiceEvent, VoiceOptions, VoiceSession};
+use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, VoiceEvent, VoiceOptions, VoiceSession};
 use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, Event, Guild, Message, Snowflake, User, VoiceState};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::session::{self, Session};
+use crate::settings::{self, Settings};
 use crate::util::{initial, time_label, user_color};
 use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, VoiceMember};
 
@@ -141,6 +142,13 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_send(|text| post(move |app| app.send(text.trim().to_owned())));
     ui.on_load_older(|| post(|app| app.load_older()));
     ui.on_toggle_mute(|| post(|app| app.toggle_mute()));
+    ui.on_open_settings(|| post(|app| app.open_settings()));
+    ui.on_save_settings(|| post(|app| app.save_settings()));
+    ui.on_configure_ptt(|| post(|app| {
+        if let Some(h) = &app.hotkey {
+            h.configure();
+        }
+    }));
     ui.on_toggle_deafen(|| post(|app| app.toggle_deafen()));
     ui.on_leave_voice(|| post(|app| app.leave_voice()));
     ui.on_logout(|| post(|app| app.logout()));
@@ -201,14 +209,17 @@ struct Voice {
     id: u64,
 }
 
-/// Настройки голоса из окружения (настройки в интерфейсе — следующий шаг):
+const APP_ID: &str = "app.feather.Feather";
+const DEFAULT_DEVICE: &str = "По умолчанию";
+
+/// Настройки голоса. Переменные окружения перекрывают настройки (для автотестов):
 /// FEATHER_MIC / FEATHER_SPEAKER — подстрока имени устройства, FEATHER_NO_RNNOISE, FEATHER_NO_AEC
-fn voice_options() -> VoiceOptions {
+fn voice_options(s: &Settings) -> VoiceOptions {
     VoiceOptions {
-        noise_suppression: std::env::var_os("FEATHER_NO_RNNOISE").is_none(),
-        echo_cancellation: std::env::var_os("FEATHER_NO_AEC").is_none(),
-        input_device: std::env::var("FEATHER_MIC").ok(),
-        output_device: std::env::var("FEATHER_SPEAKER").ok(),
+        noise_suppression: s.noise_suppression && std::env::var_os("FEATHER_NO_RNNOISE").is_none(),
+        echo_cancellation: s.echo_cancellation && std::env::var_os("FEATHER_NO_AEC").is_none(),
+        input_device: std::env::var("FEATHER_MIC").ok().or_else(|| s.input_device.clone()),
+        output_device: std::env::var("FEATHER_SPEAKER").ok().or_else(|| s.output_device.clone()),
     }
 }
 
@@ -238,6 +249,12 @@ struct App {
     voice_seq: u64,
     /// Кто в голосовых каналах (по данным сервера): пользователь → состояние
     voice_states: HashMap<Snowflake, VoiceState>,
+    settings: Settings,
+    /// Глобальная клавиша push-to-talk (пока включён режим PTT)
+    hotkey: Option<HotkeyHandle>,
+    ptt_pressed: bool,
+    /// Списки устройств, показанные в настройках (индексы ComboBox → имена)
+    device_lists: (Vec<String>, Vec<String>),
 }
 
 impl App {
@@ -277,8 +294,21 @@ impl App {
             voice: None,
             voice_seq: 0,
             voice_states: HashMap::new(),
+            settings: settings::load(),
+            hotkey: None,
+            ptt_pressed: false,
+            device_lists: (Vec::new(), Vec::new()),
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
+        APP.with_borrow_mut(|slot| {
+            if let Some(app) = slot.as_mut() {
+                app.update_hotkey();
+                // Для снимков интерфейса в автотестах
+                if std::env::var_os("FEATHER_OPEN_SETTINGS").is_some() {
+                    app.open_settings();
+                }
+            }
+        });
     }
 
     fn ui(&self) -> Option<AppWindow> {
@@ -766,19 +796,19 @@ impl App {
             id,
         });
         self.refresh_voice();
-        let (api, channel) = (self.api.clone(), c.id);
+        let (api, channel, opts) = (self.api.clone(), c.id, voice_options(&self.settings));
         self.rt.spawn(async move {
             let joined = match api.voice_join(channel).await {
-                Ok(j) => VoiceSession::join(&j.url, &j.token, voice_options(), move |ev| post(move |app| app.on_voice(id, ev))).await,
+                Ok(j) => VoiceSession::join(&j.url, &j.token, opts, move |ev| post(move |app| app.on_voice(id, ev))).await,
                 Err(e) => Err(e.to_string()),
             };
             post(move |app| {
                 let current = app.voice.as_mut().filter(|v| v.id == id);
                 match (joined, current) {
                     (Ok(session), Some(v)) => {
-                        session.set_muted(v.muted);
                         session.set_deafened(v.deafened);
                         v.session = Some(session);
+                        app.apply_mic();
                         app.refresh_voice();
                         app.send_voice_state();
                     }
@@ -828,9 +858,9 @@ impl App {
             v.muted = !v.muted;
         }
         if let Some(s) = &v.session {
-            s.set_muted(v.muted);
             s.set_deafened(v.deafened);
         }
+        self.apply_mic();
         self.refresh_voice();
         self.send_voice_state();
     }
@@ -843,6 +873,94 @@ impl App {
         }
         self.refresh_voice();
         self.send_voice_state();
+    }
+
+    /// Микрофон реально передаёт звук: не выключен вручную и (в режиме PTT) клавиша нажата
+    fn apply_mic(&self) {
+        if let Some(v) = &self.voice
+            && let Some(s) = &v.session
+        {
+            s.set_muted(v.muted || (self.settings.push_to_talk && !self.ptt_pressed));
+        }
+    }
+
+    /// Включить/выключить глобальную клавишу в соответствии с настройкой PTT
+    fn update_hotkey(&mut self) {
+        if !self.settings.push_to_talk {
+            self.hotkey = None;
+            self.ptt_pressed = false;
+            return;
+        }
+        if self.hotkey.is_none() {
+            let _guard = self.rt.enter();
+            self.hotkey = Some(feather_core::hotkey::register(APP_ID, |ev| post(move |app| app.on_hotkey(ev))));
+        }
+    }
+
+    fn on_hotkey(&mut self, ev: HotkeyEvent) {
+        match ev {
+            HotkeyEvent::Bound(key) => {
+                if let Some(ui) = self.ui() {
+                    ui.set_ptt_key(key.as_str().into());
+                }
+                if key.is_empty() {
+                    self.set_status("Назначьте клавишу push-to-talk в открывшемся окне");
+                }
+            }
+            HotkeyEvent::Pressed => {
+                self.ptt_pressed = true;
+                self.apply_mic();
+            }
+            HotkeyEvent::Released => {
+                self.ptt_pressed = false;
+                self.apply_mic();
+            }
+            HotkeyEvent::Unavailable(e) => self.set_status(format!("Push-to-talk недоступен: {e}")),
+        }
+    }
+
+    // ------------------------------------------------------------ настройки
+
+    fn open_settings(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let (inputs, outputs) = feather_core::list_devices();
+        let with_default = |list: &[String]| -> Vec<SharedString> {
+            std::iter::once(DEFAULT_DEVICE.into()).chain(list.iter().map(|d| d.as_str().into())).collect()
+        };
+        let index = |list: &[String], want: &Option<String>| -> i32 {
+            want.as_ref().and_then(|w| list.iter().position(|d| d == w)).map_or(0, |i| i as i32 + 1)
+        };
+        ui.set_input_devices(ModelRc::new(VecModel::from(with_default(&inputs))));
+        ui.set_output_devices(ModelRc::new(VecModel::from(with_default(&outputs))));
+        ui.set_set_input(index(&inputs, &self.settings.input_device));
+        ui.set_set_output(index(&outputs, &self.settings.output_device));
+        ui.set_set_ptt(self.settings.push_to_talk);
+        ui.set_set_noise(self.settings.noise_suppression);
+        ui.set_set_echo(self.settings.echo_cancellation);
+        ui.set_set_economy(self.settings.economy_mode);
+        self.device_lists = (inputs, outputs);
+        ui.set_dialog("settings".into());
+    }
+
+    fn save_settings(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let pick = |list: &[String], i: i32| -> Option<String> { (i > 0).then(|| list.get(i as usize - 1).cloned()).flatten() };
+        let economy_before = self.settings.economy_mode;
+        self.settings = Settings {
+            push_to_talk: ui.get_set_ptt(),
+            input_device: pick(&self.device_lists.0, ui.get_set_input()),
+            output_device: pick(&self.device_lists.1, ui.get_set_output()),
+            noise_suppression: ui.get_set_noise(),
+            echo_cancellation: ui.get_set_echo(),
+            economy_mode: ui.get_set_economy(),
+        };
+        settings::save(&self.settings);
+        ui.set_dialog(SharedString::new());
+        self.update_hotkey();
+        self.apply_mic();
+        if self.settings.economy_mode != economy_before {
+            self.set_status("Режим отрисовки сменится после перезапуска Feather");
+        }
     }
 
     fn leave_voice(&mut self) {

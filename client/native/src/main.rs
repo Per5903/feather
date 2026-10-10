@@ -5,6 +5,7 @@ mod client;
 mod demo;
 mod mock;
 mod session;
+mod settings;
 mod util;
 
 use std::time::Duration;
@@ -20,6 +21,11 @@ fn main() -> Result<(), slint::PlatformError> {
     if std::env::var_os("LK_DISABLE_NVDEC").is_none() {
         // SAFETY: в самом начале main, до запуска других потоков
         unsafe { std::env::set_var("LK_DISABLE_NVDEC", "1") };
+    }
+    // Экономный режим: программная отрисовка (выбирается до создания окна)
+    if settings::load().economy_mode && std::env::var_os("SLINT_BACKEND").is_none() {
+        // SAFETY: в самом начале main, до запуска других потоков
+        unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") };
     }
     let ui = AppWindow::new()?;
 

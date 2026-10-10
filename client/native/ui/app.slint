@@ -1,7 +1,7 @@
 // Клиент Feather на Slint. Правила лёгкости (docs/02-performance.md):
 // никаких тяжёлых эффектов, анимации только простые, списки виртуализированы.
 
-import { ListView, LineEdit, Button } from "std-widgets.slint";
+import { ListView, LineEdit, Button, ComboBox, Switch } from "std-widgets.slint";
 
 export struct Msg {
     head: bool,
@@ -391,6 +391,107 @@ component Dialog inherits Rectangle {
     }
 }
 
+component SettingRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> hint;
+    in-out property <bool> checked;
+    spacing: 12px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: title; color: Theme.text; }
+        if hint != "": Text {
+            text: hint;
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        Switch { checked <=> root.checked; }
+    }
+}
+
+component SettingsDialog inherits Rectangle {
+    in property <[string]> input-devices;
+    in property <[string]> output-devices;
+    in-out property <int> input-index;
+    in-out property <int> output-index;
+    in-out property <bool> ptt;
+    in-out property <bool> noise;
+    in-out property <bool> echo;
+    in-out property <bool> economy;
+    in property <string> ptt-key;
+    callback save();
+    callback cancel();
+    callback configure-ptt();
+    background: #000000a8;
+    TouchArea { }
+    Rectangle {
+        width: 480px;
+        height: box.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg1;
+        border-radius: 10px;
+        box := VerticalLayout {
+            padding: 22px;
+            spacing: 14px;
+            Text {
+                text: "Настройки";
+                color: Theme.text;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            Field {
+                label: "МИКРОФОН";
+                ComboBox { model: input-devices; current-index <=> root.input-index; }
+            }
+            Field {
+                label: "ВЫВОД ЗВУКА";
+                ComboBox { model: output-devices; current-index <=> root.output-index; }
+            }
+            SettingRow {
+                title: "Push-to-talk";
+                hint: ptt ? (ptt-key == "" ? "Клавиша не назначена" : "Клавиша: " + ptt-key) : "Выключено: микрофон передаёт звук всё время";
+                checked <=> root.ptt;
+            }
+            if ptt: HorizontalLayout {
+                alignment: start;
+                Button { text: "Назначить клавишу…"; clicked => { root.configure-ptt(); } }
+            }
+            SettingRow {
+                title: "Шумоподавление";
+                hint: "Нейросеть RNNoise: убирает шум вентилятора, клавиатуры, улицы";
+                checked <=> root.noise;
+            }
+            SettingRow {
+                title: "Эхоподавление";
+                hint: "Нужно, если звук идёт в колонки. В наушниках можно выключить";
+                checked <=> root.echo;
+            }
+            SettingRow {
+                title: "Экономный режим";
+                hint: "Отрисовка без видеокарты: в 3–4 раза меньше памяти. После перезапуска";
+                checked <=> root.economy;
+            }
+            Text {
+                text: "Устройства и обработка звука применяются при следующем входе в голосовой канал.";
+                color: Theme.dim;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Button { text: "Отмена"; clicked => { root.cancel(); } }
+                Button { text: "Сохранить"; primary: true; clicked => { root.save(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Feather";
     preferred-width: 1280px;
@@ -436,6 +537,20 @@ export component AppWindow inherits Window {
     in property <bool> voice-muted;
     in property <bool> voice-deafened;
     callback toggle-mute();
+
+    // ---- настройки
+    in property <[string]> input-devices;
+    in property <[string]> output-devices;
+    in-out property <int> set-input;
+    in-out property <int> set-output;
+    in-out property <bool> set-ptt;
+    in-out property <bool> set-noise;
+    in-out property <bool> set-echo;
+    in-out property <bool> set-economy;
+    in property <string> ptt-key;
+    callback open-settings();
+    callback save-settings();
+    callback configure-ptt();
     callback toggle-deafen();
     callback leave-voice();
     callback select-channel(int);
@@ -668,6 +783,14 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             IconButton {
+                                // Настройки: шестерёнка
+                                icon: "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z";
+                                clicked => { root.open-settings(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
                                 // «Выйти»
                                 icon: "M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z";
                                 clicked => { root.logout(); }
@@ -810,6 +933,20 @@ export component AppWindow inherits Window {
         value <=> root.dialog-value;
         ok => { root.dialog-ok(); }
         cancel => { root.dialog = ""; }
+    }
+    if dialog == "settings": SettingsDialog {
+        input-devices: root.input-devices;
+        output-devices: root.output-devices;
+        input-index <=> root.set-input;
+        output-index <=> root.set-output;
+        ptt <=> root.set-ptt;
+        noise <=> root.set-noise;
+        echo <=> root.set-echo;
+        economy <=> root.set-economy;
+        ptt-key: root.ptt-key;
+        save => { root.save-settings(); }
+        cancel => { root.dialog = ""; }
+        configure-ptt => { root.configure-ptt(); }
     }
     if dialog == "invite": Dialog {
         title: "Пригласить друзей";

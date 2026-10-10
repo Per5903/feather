@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Feather
+Comment=Лёгкий мессенджер с голосом для своего сервера
+Exec=feather
+Icon=app.feather.Feather
+Categories=Network;Chat;InstantMessaging;
+Terminal=false
+StartupWMClass=feather

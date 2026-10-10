@@ -2344,6 +2344,7 @@ dependencies = [
 name = "feather-core"
 version = "0.0.1"
 dependencies = [
+ "ashpd",
  "cpal",
  "feather-protocol",
  "futures-util",
