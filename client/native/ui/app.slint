@@ -49,8 +49,10 @@ export struct ChannelItem {
     kind: ChannelKind,
     active: bool,
     unread: bool,
-    /// Кто сидит в голосовом канале (пока видно только своему каналу)
+    /// Кто сидит в голосовом канале
     voice-members: [VoiceMember],
+    /// У категории кнопка «+» (создать канал) — только тем, кто может
+    can-add: bool,
 }
 
 global Theme {
@@ -209,6 +211,7 @@ component MessageRow inherits Rectangle {
 component ChannelRow inherits VerticalLayout {
     in property <ChannelItem> c;
     callback clicked();
+    callback add();
     Rectangle {
         property <bool> lit: c.active || c.unread || cta.has-hover;
         height: c.kind == ChannelKind.category ? 30px : 32px;
@@ -242,6 +245,24 @@ component ChannelRow inherits VerticalLayout {
                 font-size: c.kind == ChannelKind.category ? 12px : 15px;
                 font-weight: c.kind == ChannelKind.category || c.unread ? 600 : 400;
                 vertical-alignment: c.kind == ChannelKind.category ? bottom : center;
+                horizontal-stretch: 1;
+            }
+            if c.can-add: VerticalLayout {
+                alignment: end;
+                Rectangle {
+                    width: 22px;
+                    height: 20px;
+                    ata := TouchArea { clicked => { root.add(); } }
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "+";
+                        font-size: 18px;
+                        color: ata.has-hover ? Theme.text : Theme.dim;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
             }
         }
     }
@@ -370,6 +391,9 @@ component Dialog inherits Rectangle {
     in property <string> ok-text;
     in property <bool> read-only;
     in-out property <string> value;
+    /// Дополнительный переключатель (например «Голосовой канал»), если задана подпись
+    in property <string> switch-label;
+    in-out property <bool> switch-value;
     callback ok();
     callback cancel();
     background: #000000a8;
@@ -400,6 +424,16 @@ component Dialog inherits Rectangle {
                 text <=> root.value;
                 read-only: root.read-only;
                 accepted => { root.ok(); }
+            }
+            if switch-label != "": HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: switch-label;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Switch { checked <=> root.switch-value; }
             }
             HorizontalLayout {
                 alignment: end;
@@ -595,6 +629,8 @@ export component AppWindow inherits Window {
     callback create-guild-dialog();
     callback join-guild-dialog();
     callback invite();
+    callback add-channel(int);
+    in-out property <bool> dialog-switch;
 
     // ---- диалоги: "", "create", "join", "invite"
     in-out property <string> dialog;
@@ -741,6 +777,7 @@ export component AppWindow inherits Window {
                     for c[i] in channels: ChannelRow {
                         c: c;
                         clicked => { root.select-channel(i); }
+                        add => { root.add-channel(i); }
                     }
                 }
                 if voice-channel != "": Rectangle {
@@ -1026,6 +1063,16 @@ export component AppWindow inherits Window {
         save => { root.save-settings(); }
         cancel => { root.dialog = ""; }
         configure-ptt => { root.configure-ptt(); }
+    }
+    if dialog == "channel": Dialog {
+        title: "Новый канал";
+        hint: "Название канала, например «рейды» или «Лобби».";
+        ok-text: "Создать";
+        switch-label: "Голосовой канал";
+        switch-value <=> root.dialog-switch;
+        value <=> root.dialog-value;
+        ok => { root.dialog-ok(); }
+        cancel => { root.dialog = ""; }
     }
     if dialog == "delete": Dialog {
         title: "Удалить сообщение?";

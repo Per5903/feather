@@ -157,6 +157,7 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_leave_voice(|| post(|app| app.leave_voice()));
     ui.on_logout(|| post(|app| app.logout()));
     ui.on_invite(|| post(|app| app.invite()));
+    ui.on_add_channel(|i| post(move |app| app.ask_add_channel(i as usize)));
 
     let weak = ui.as_weak();
     ui.on_create_guild_dialog(move || open_dialog(&weak, "create"));
@@ -283,6 +284,8 @@ struct App {
     editing: Option<Snowflake>,
     /// Сообщение, ожидающее подтверждения удаления
     pending_delete: Option<Snowflake>,
+    /// Категория, в которой создаётся канал
+    pending_parent: Option<Snowflake>,
     /// Кто печатает в открытом канале: пользователь → (имя, когда сообщил)
     typing: HashMap<Snowflake, (String, std::time::Instant)>,
     last_typing_sent: Option<std::time::Instant>,
@@ -333,6 +336,7 @@ impl App {
             ptt_pressed: false,
             editing: None,
             pending_delete: None,
+            pending_parent: None,
             typing: HashMap::new(),
             last_typing_sent: None,
             typing_timer: Timer::default(),
@@ -401,6 +405,8 @@ impl App {
                 active: Some(c.id) == self.channel || self.voice.as_ref().is_some_and(|v| v.channel == c.id),
                 unread: self.unread.contains_key(&c.id),
                 voice_members: self.voice_members(c.id),
+                // Создавать каналы пока может владелец сервера (роли — следующий шаг)
+                can_add: c.kind == Kind::Category && self.moderator(),
             })
             .collect();
         ui.set_channels(ModelRc::new(VecModel::from(items)));
@@ -700,6 +706,18 @@ impl App {
     fn cancel_edit(&mut self) {
         self.editing = None;
         self.set_editing_ui(false);
+    }
+
+    fn ask_add_channel(&mut self, i: usize) {
+        let Some(cat) = self.channels.get(i).filter(|c| c.kind == Kind::Category) else { return };
+        self.pending_parent = Some(cat.id);
+        if let Some(ui) = self.ui() {
+            ui.set_dialog_value(SharedString::new());
+            // В категории голосовых по умолчанию предлагаем голосовой канал
+            let voice_cat = self.channels.iter().any(|c| c.parent_id == Some(cat.id) && c.kind == Kind::Voice);
+            ui.set_dialog_switch(voice_cat);
+            ui.set_dialog("channel".into());
+        }
     }
 
     fn ask_delete(&mut self, i: usize) {
@@ -1159,6 +1177,22 @@ impl App {
         if kind == "delete" {
             ui.set_dialog(SharedString::new());
             self.delete_confirmed();
+            return;
+        }
+        if kind == "channel" {
+            let (Some(guild), parent) = (self.guild, self.pending_parent.take()) else { return };
+            if value.is_empty() {
+                return;
+            }
+            let ch_kind = if ui.get_dialog_switch() { Kind::Voice } else { Kind::Text };
+            ui.set_dialog(SharedString::new());
+            let api = self.api.clone();
+            self.rt.spawn(async move {
+                // Сам канал появится в списке событием CHANNEL_CREATE
+                if let Err(e) = api.create_channel(guild, &value, ch_kind, parent).await {
+                    post(move |app| app.set_status(format!("Канал не создан: {e}")));
+                }
+            });
             return;
         }
         if value.is_empty() {

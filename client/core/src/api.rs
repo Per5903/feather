@@ -123,6 +123,11 @@ impl Api {
         self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/channels"), None).await
     }
 
+    pub async fn create_channel(&self, guild: Snowflake, name: &str, kind: ChannelKind, parent: Option<Snowflake>) -> Result<Channel> {
+        let req = CreateChannelRequest { name: name.into(), kind, parent_id: parent };
+        self.call(Method::POST, &format!("/guilds/{guild}/channels"), Some(&req)).await
+    }
+
     pub async fn members(&self, guild: Snowflake) -> Result<Vec<User>> {
         self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/members"), None).await
     }
