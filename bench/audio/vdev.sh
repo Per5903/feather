@@ -17,6 +17,9 @@ stop_play() {
 
 case "${1:-}" in
   up)
+    if pactl list short sinks | grep -q feather_vmic_sink; then
+      echo "виртуальные устройства уже созданы"; exit 0
+    fi
     : > "$STATE"
     pactl load-module module-null-sink sink_name=feather_vmic_sink \
       sink_properties=device.description=FeatherVirtualMicSink >> "$STATE"
