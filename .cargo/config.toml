@@ -2,3 +2,9 @@
 # Переменная окружения CUDA_HOME, если задана, имеет приоритет.
 [env]
 CUDA_HOME = { value = "/opt/cuda", force = false }
+
+# Windows: готовый libwebrtc от LiveKit собран со статической CRT (/MT) — Rust должен так же,
+# иначе компоновщик: «mismatch detected for 'RuntimeLibrary'». Заодно feather.exe не требует
+# установленного Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
