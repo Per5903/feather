@@ -51,27 +51,21 @@ async fn main() -> ashpd::Result<()> {
 
     let mut pressed = portal.receive_activated().await?;
     let mut released = portal.receive_deactivated().await?;
-    // Метка времени портала в KDE не в системной шкале (почти ноль), поэтому абсолютную
-    // задержку по ней не посчитать. Сверяем только длительность удержания: по меткам KDE
-    // и по нашим часам — расхождение показывает разброс доставки событий.
-    let mut down_at: Option<(Instant, Duration)> = None;
+    // KDE 6.7 присылает timestamp = 0 во всех событиях, поэтому задержку по нему
+    // не измерить; время удержания считаем по своим часам.
+    let mut down_at: Option<Instant> = None;
     println!("жду нажатий (Ctrl+C — выход)");
     loop {
         tokio::select! {
             Some(ev) = pressed.next() => {
                 if ev.shortcut_id() != PTT_ID { continue; }
                 println!("▶ говорю");
-                down_at = Some((Instant::now(), ev.timestamp()));
+                down_at = Some(Instant::now());
             }
             Some(ev) = released.next() => {
                 if ev.shortcut_id() != PTT_ID { continue; }
-                if let Some((at, ts)) = down_at.take() {
-                    let ours = at.elapsed().as_millis() as i64;
-                    let kde = ev.timestamp().saturating_sub(ts).as_millis() as i64;
-                    println!("■ замолчал    (держал {ours} мс по нашим часам, {kde} мс по KDE, расхождение {} мс)", ours - kde);
-                } else {
-                    println!("■ замолчал");
-                }
+                let held = down_at.take().map_or(Duration::ZERO, |t| t.elapsed());
+                println!("■ замолчал    (держал {:.2} с)", held.as_secs_f64());
             }
             _ = tokio::signal::ctrl_c() => break,
         }
