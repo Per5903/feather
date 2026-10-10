@@ -379,6 +379,8 @@ export component AppWindow inherits Window {
     /// Строка состояния: «нет связи…», ошибки отправки
     in property <string> status;
 
+    /// Долистали до начала ленты: пора подгрузить сообщения постарше
+    callback load-older();
     callback select-guild(int);
     callback select-channel(int);
     callback send(string);
@@ -393,6 +395,13 @@ export component AppWindow inherits Window {
 
     public pure function near-bottom() -> bool {
         list.content-y - (list.visible-height - list.content-height) < 80px
+    }
+    public pure function content-height() -> length {
+        list.content-height
+    }
+    /// Сдвинуть ленту на delta: после вставки сообщений сверху сохраняем видимое место
+    public function shift-scroll(delta: length) {
+        list.content-y = max(list.visible-height - list.content-height, min(0px, list.content-y - delta));
     }
     public function scroll-to-bottom() {
         list.content-y = min(0px, list.visible-height - list.content-height);
@@ -591,6 +600,11 @@ export component AppWindow inherits Window {
                 // ListView виртуализирован: создаются только видимые строки
                 list := ListView {
                     vertical-stretch: 1;
+                    changed content-y => {
+                        if (self.content-y > -200px && self.content-height > self.visible-height) {
+                            root.load-older();
+                        }
+                    }
                     for m in messages: MessageRow { m: m; }
                 }
                 Rectangle {

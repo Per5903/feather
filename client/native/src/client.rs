@@ -112,7 +112,13 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
                 Ok(resp) => {
                     ui.set_login_password(SharedString::new());
                     let api = api.with_token(resp.token.clone());
-                    session::save(&Session { server: api.base().into(), username: resp.user.username.clone(), token: Some(resp.token) });
+                    let prev = session::load().filter(|s| s.server == api.base() && s.username == resp.user.username);
+                    session::save(&Session {
+                        server: api.base().into(),
+                        username: resp.user.username.clone(),
+                        token: Some(resp.token),
+                        ..prev.unwrap_or_default()
+                    });
                     App::start(ui, rt2, api, resp.user);
                 }
                 Err(e) => ui.set_login_error(e.to_string().into()),
@@ -133,6 +139,7 @@ fn wire_callbacks(ui: &AppWindow) {
         }
     }));
     ui.on_send(|text| post(move |app| app.send(text.trim().to_owned())));
+    ui.on_load_older(|| post(|app| app.load_older()));
     ui.on_logout(|| post(|app| app.logout()));
     ui.on_invite(|| post(|app| app.invite()));
 
@@ -196,6 +203,9 @@ struct App {
     model: Rc<VecModel<Msg>>,
     /// Номер загрузки: ответы на устаревшие запросы (пользователь уже ушёл в другой канал) игнорируем
     load_gen: u64,
+    /// Идёт подгрузка старых сообщений / в канале есть ещё более старые
+    loading_older: bool,
+    has_older: bool,
 }
 
 impl App {
@@ -230,6 +240,8 @@ impl App {
             messages: Vec::new(),
             model,
             load_gen: 0,
+            loading_older: false,
+            has_older: false,
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
     }
@@ -348,7 +360,11 @@ impl App {
                         app.channels = ordered(channels);
                         app.members = members;
                         app.refresh_members();
-                        if let Some(first) = app.channels.iter().find(|c| c.kind == Kind::Text).cloned() {
+                        // Открываем последний канал, где был пользователь, иначе первый текстовый
+                        let remembered = session::load()
+                            .and_then(|s| s.last_channels.get(&id.to_string()).cloned())
+                            .and_then(|cid| app.channels.iter().find(|c| c.id.to_string() == cid && c.kind == Kind::Text).cloned());
+                        if let Some(first) = remembered.or_else(|| app.channels.iter().find(|c| c.kind == Kind::Text).cloned()) {
                             app.select_channel(&first);
                         } else {
                             app.refresh_channels();
@@ -371,11 +387,14 @@ impl App {
         }
         self.set_status("");
         self.channel = Some(c.id);
+        session::remember(&c.guild_id.to_string(), &c.id.to_string());
         self.unread.remove(&c.id);
         self.refresh_channels();
         self.refresh_guilds();
         self.messages.clear();
         self.model.set_vec(Vec::new());
+        self.loading_older = false;
+        self.has_older = false;
 
         self.load_gen += 1;
         let (api, generation, id) = (self.api.clone(), self.load_gen, c.id);
@@ -387,6 +406,7 @@ impl App {
                 }
                 match res {
                     Ok(mut history) => {
+                        app.has_older = history.len() as u32 == HISTORY_LIMIT;
                         history.reverse(); // сервер отдаёт новые сверху
                         // Пока шла загрузка, могли прийти новые сообщения через шлюз
                         for m in std::mem::take(&mut app.messages) {
@@ -401,6 +421,61 @@ impl App {
                     }
                     Err(e) => app.set_status(format!("Не удалось загрузить историю: {e}")),
                 }
+            });
+        });
+    }
+
+    /// Подгрузка сообщений старше первого показанного (прокрутка вверх)
+    fn load_older(&mut self) {
+        let (Some(channel), Some(oldest)) = (self.channel, self.messages.first().map(|m| m.id)) else { return };
+        if self.loading_older || !self.has_older {
+            return;
+        }
+        self.loading_older = true;
+        let (api, generation) = (self.api.clone(), self.load_gen);
+        self.rt.spawn(async move {
+            let res = api.history(channel, Some(oldest), HISTORY_LIMIT).await;
+            post(move |app| {
+                if app.load_gen != generation {
+                    return;
+                }
+                app.loading_older = false;
+                let Ok(mut older) = res else {
+                    app.set_status("Не удалось загрузить старые сообщения");
+                    return;
+                };
+                app.has_older = older.len() as u32 == HISTORY_LIMIT;
+                if older.is_empty() {
+                    return;
+                }
+                older.reverse();
+                let added = older.len();
+                if std::env::var_os("FEATHER_LOG").is_some() {
+                    eprintln!("история: +{added} старых, всего {}, есть ещё: {}", added + app.messages.len(), app.has_older);
+                }
+                let Some(ui) = app.ui() else { return };
+                let before = ui.invoke_content_height();
+                older.append(&mut app.messages);
+                app.messages = older;
+                // Перестраиваем добавленные строки и первую старую (у неё могла пропасть шапка)
+                let rows: Vec<Msg> = (0..=added.min(app.messages.len() - 1))
+                    .map(|i| msg_row(i.checked_sub(1).map(|p| &app.messages[p]), &app.messages[i]))
+                    .collect();
+                let first_old = rows[added.min(rows.len() - 1)].clone();
+                for (i, row) in rows.into_iter().take(added).enumerate() {
+                    app.model.insert(i, row);
+                }
+                if added < app.messages.len() {
+                    app.model.set_row_data(added, first_old);
+                }
+                // Лента выросла сверху: сдвигаем на прирост высоты, чтобы видимое место не убежало
+                let weak = app.ui.clone();
+                Timer::single_shot(Duration::from_millis(16), move || {
+                    if let Some(ui) = weak.upgrade() {
+                        let delta = ui.invoke_content_height() - before;
+                        ui.invoke_shift_scroll(delta);
+                    }
+                });
             });
         });
     }
@@ -478,7 +553,11 @@ impl App {
                         }
                         self.refresh_guilds();
                     }
-                    None => match self.guilds.first().map(|g| g.id) {
+                    None => match session::load()
+                        .and_then(|s| s.last_guild)
+                        .and_then(|lg| self.guilds.iter().find(|g| g.id.to_string() == lg).map(|g| g.id))
+                        .or_else(|| self.guilds.first().map(|g| g.id))
+                    {
                         Some(first) => self.select_guild(first),
                         None => {
                             self.refresh_guilds();

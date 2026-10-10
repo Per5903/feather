@@ -4,6 +4,7 @@
 //! чтобы запускать несколько клиентов на одной машине (тесты, второй аккаунт).
 //! TODO: хранить токен в системном хранилище ключей (Secret Service / Windows Credential Manager).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,12 @@ pub struct Session {
     pub server: String,
     pub username: String,
     pub token: Option<String>,
+    /// Последний открытый канал на каждом сервере: id сервера → id канала
+    #[serde(default)]
+    pub last_channels: HashMap<String, String>,
+    /// Последний открытый сервер
+    #[serde(default)]
+    pub last_guild: Option<String>,
 }
 
 fn path() -> Option<PathBuf> {
@@ -51,6 +58,15 @@ pub fn save(s: &Session) {
 pub fn forget_token() {
     if let Some(mut s) = load() {
         s.token = None;
+        save(&s);
+    }
+}
+
+/// Запомнить, где пользователь был, чтобы открыть там же при следующем запуске
+pub fn remember(guild: &str, channel: &str) {
+    if let Some(mut s) = load() {
+        s.last_guild = Some(guild.to_owned());
+        s.last_channels.insert(guild.to_owned(), channel.to_owned());
         save(&s);
     }
 }
