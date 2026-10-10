@@ -241,8 +241,13 @@ fn voice_options(s: &Settings) -> VoiceOptions {
         echo_cancellation: s.echo_cancellation && std::env::var_os("FEATHER_NO_AEC").is_none(),
         input_device: std::env::var("FEATHER_MIC").ok().or_else(|| s.input_device.clone()),
         output_device: std::env::var("FEATHER_SPEAKER").ok().or_else(|| s.output_device.clone()),
+        // В режиме PTT решает клавиша; FEATHER_NO_VAD — выключить для замеров
+        voice_activation: !s.push_to_talk && std::env::var_os("FEATHER_NO_VAD").is_none(),
     }
 }
+
+/// После отпускания push-to-talk звук идёт ещё столько: не обрезаем последний слог
+const PTT_RELEASE_TAIL: Duration = Duration::from_millis(250);
 
 struct App {
     ui: Weak<AppWindow>,
@@ -1069,7 +1074,8 @@ impl App {
             }
             HotkeyEvent::Released => {
                 self.ptt_pressed = false;
-                self.apply_mic();
+                // Выключаем микрофон с небольшой задержкой, если клавишу не нажали снова
+                Timer::single_shot(PTT_RELEASE_TAIL, || post(|app| app.apply_mic()));
             }
             HotkeyEvent::Unavailable(e) => self.set_status(format!("Push-to-talk недоступен: {e}")),
         }

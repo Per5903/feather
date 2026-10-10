@@ -31,6 +31,12 @@ const SAMPLE_RATE: u32 = 48_000;
 const FRAME: usize = 480;
 /// Запас колец: 200 мс. Больше — значит, обработка не успевает, лишнее выбрасываем
 const RING: usize = FRAME * 20;
+/// Порог вероятности речи RNNoise для активации голосом
+const VAD_THRESHOLD: f32 = 0.6;
+/// Без шумодава: порог громкости (≈ −40 dBFS)
+const ENERGY_GATE_RMS: f64 = 330.0;
+/// После речи держим передачу ещё 400 мс: не обрезаем окончания слов и короткие паузы
+const GATE_HANGOVER_FRAMES: u32 = 40;
 /// Размер буфера устройства оставляем системе. Замер 11: фиксированный буфер 20 мс в бэкенде
 /// PulseAudio поднял нагрузку аудиопотока с 3,4 до 8,7 % — хуже, а не лучше.
 fn with_buffer<S>(mut build: impl FnMut(cpal::BufferSize) -> Option<S>) -> Option<S> {
@@ -75,11 +81,15 @@ pub struct VoiceOptions {
     pub input_device: Option<String>,
     /// Устройство вывода по подстроке имени; None — по умолчанию
     pub output_device: Option<String>,
+    /// Активация голосом: передавать звук, только когда в нём есть речь (VAD RNNoise).
+    /// В паузах кодировщик простаивает (экономия CPU и трафика), клавиатуру между фразами не слышно.
+    /// Для push-to-talk не нужна: там решает клавиша.
+    pub voice_activation: bool,
 }
 
 impl Default for VoiceOptions {
     fn default() -> Self {
-        Self { noise_suppression: true, echo_cancellation: true, input_device: None, output_device: None }
+        Self { noise_suppression: true, echo_cancellation: true, input_device: None, output_device: None, voice_activation: true }
     }
 }
 
@@ -163,7 +173,7 @@ impl VoiceSession {
             on_event(VoiceEvent::Warning(warning));
         }
 
-        tokio::spawn(process_capture(shared.clone(), source, cap_cons, rev_cons, opts.noise_suppression, opts.echo_cancellation));
+        tokio::spawn(process_capture(shared.clone(), source, cap_cons, rev_cons, opts.clone()));
 
         let me = room.local_participant().identity().to_string();
         let peers = room
@@ -339,10 +349,12 @@ async fn process_capture(
     source: NativeAudioSource,
     mut cap: HeapCons<f32>,
     mut rev: HeapCons<f32>,
-    noise_suppression: bool,
-    echo_cancellation: bool,
+    opts: VoiceOptions,
 ) {
+    let VoiceOptions { noise_suppression, echo_cancellation, voice_activation, .. } = opts;
     let mut apm = AudioProcessingModule::new(echo_cancellation, true, true, false);
+    // Активация голосом: открыта ещё столько кадров после последнего кадра с речью
+    let mut gate_open_frames = 0u32;
     let mut denoise = DenoiseState::new();
     let mut frame = [0f32; FRAME];
     let mut pcm = [0i16; FRAME];
@@ -375,14 +387,28 @@ async fn process_capture(
             }
             let _ = apm.process_stream(&mut pcm, SAMPLE_RATE as i32, 1);
 
-            if noise_suppression {
+            // Вероятность речи в кадре: от RNNoise, а без шумодава — по громкости
+            let speech = if noise_suppression {
                 // RNNoise работает в шкале i16, но во float
                 for (o, s) in frame.iter_mut().zip(&pcm) {
                     *o = *s as f32;
                 }
-                denoise.process_frame(&mut clean, &frame);
+                let vad = denoise.process_frame(&mut clean, &frame);
                 for (o, s) in pcm.iter_mut().zip(&clean) {
                     *o = s.clamp(-32768.0, 32767.0) as i16;
+                }
+                vad > VAD_THRESHOLD
+            } else {
+                let rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / FRAME as f64).sqrt();
+                rms > ENERGY_GATE_RMS
+            };
+            if voice_activation {
+                if speech {
+                    gate_open_frames = GATE_HANGOVER_FRAMES;
+                } else if gate_open_frames == 0 {
+                    continue; // тишина: кадр не кодируем и не отправляем
+                } else {
+                    gate_open_frames -= 1;
                 }
             }
             let af = AudioFrame { data: pcm.as_slice().into(), sample_rate: SAMPLE_RATE, num_channels: 1, samples_per_channel: FRAME as u32 };
