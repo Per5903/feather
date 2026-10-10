@@ -10,3 +10,5 @@ bench/results/*.json
 !bench/results/.gitkeep
 # Tauri
 client/desktop/gen/
+bench/audio/src/
+bench/audio/*.wav

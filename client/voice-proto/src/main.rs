@@ -3,11 +3,17 @@
 //! Режимы:
 //!   latency      — в одном процессе два участника: один пищит раз в секунду,
 //!                  другой ловит писк. Печатает задержку «отправка → декодированный звук».
-//!   peer <имя>   — обычный участник голосового канала: шлёт «речь» и принимает всех.
+//!   peer <имя>   — обычный участник голосового канала: шлёт синтетическую «речь» и принимает всех.
 //!                  Запускается в нескольких процессах для замера CPU/RAM (bench/measure.py).
+//!   device <имя> — участник с настоящими аудиоустройствами (PlatformAudio, шумодав/AEC/AGC).
+//!                  Устройства выбираются по подстроке имени: FEATHER_MIC, FEATHER_SPK.
+//!                  На Linux надёжнее PULSE_SOURCE/PULSE_SINK: PipeWire «вспоминает» прошлое
+//!                  устройство для приложения «WEBRTC VoiceEngine» и игнорирует выбор (bench/README.md).
+//!                  FEATHER_NO_APM=1 просит выключить обработку, но в SDK 0.9.4 на десктопе
+//!                  это выключает только аппаратную; программная (шумодав и т.д.) остаётся.
+//!   record <файл.wav> <секунд> — пишет первый услышанный голос в файл (оценка шумодава).
 //!
-//! Звук синтетический (без микрофона и динамиков), чтобы тест шёл без человека.
-//! Реальные устройства в SDK есть (livekit::PlatformAudio), они следующий шаг.
+//! Виртуальные устройства и тестовая речь: bench/audio/ (vdev.sh, make_noisy.py).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -193,12 +199,125 @@ async fn peer_mode(name: String) {
     }
 }
 
+async fn device_mode(name: String) {
+    let audio = PlatformAudio::new().expect("не удалось открыть аудиоустройства");
+    let pick = |var: &str| std::env::var(var).ok().map(|v| v.to_lowercase());
+    println!("микрофоны:");
+    for d in audio.recording_devices() {
+        println!("  [{}] {}", d.index, d.name);
+    }
+    println!("динамики:");
+    for d in audio.playout_devices() {
+        println!("  [{}] {}", d.index, d.name);
+    }
+    if let Some(want) = pick("FEATHER_MIC") {
+        let d = audio
+            .recording_devices()
+            .find(|d| d.name.to_lowercase().contains(&want))
+            .unwrap_or_else(|| panic!("микрофон «{want}» не найден"));
+        audio.set_recording_device(&d.id).expect("не удалось выбрать микрофон");
+        println!("микрофон: {}", d.name);
+    }
+    if let Some(want) = pick("FEATHER_SPK") {
+        let d = audio
+            .playout_devices()
+            .find(|d| d.name.to_lowercase().contains(&want))
+            .unwrap_or_else(|| panic!("динамики «{want}» не найдены"));
+        audio.set_playout_device(&d.id).expect("не удалось выбрать динамики");
+        println!("динамики: {}", d.name);
+    }
+    let apm = std::env::var_os("FEATHER_NO_APM").is_none();
+    audio
+        .configure_audio_processing(AudioProcessingOptions {
+            echo_cancellation: apm,
+            noise_suppression: apm,
+            auto_gain_control: apm,
+            ..Default::default()
+        })
+        .expect("не удалось настроить обработку звука");
+    println!(
+        "обработка звука запрошена: {}; активна: AEC {:?}, NS {:?}, AGC {:?}",
+        if apm { "вкл" } else { "выкл" },
+        audio.active_aec_type(),
+        audio.active_ns_type(),
+        audio.active_agc_type()
+    );
+
+    let (room, mut events) = join(&name).await;
+    let track = LocalAudioTrack::create_audio_track("mic", audio.rtc_source());
+    room.local_participant()
+        .publish_track(
+            LocalTrack::Audio(track),
+            TrackPublishOptions { source: TrackSource::Microphone, dtx: true, ..Default::default() },
+        )
+        .await
+        .expect("не удалось опубликовать микрофон");
+    println!("{name}: в канале");
+    // Чужие треки в режиме PlatformAudio воспроизводятся устройством автоматически
+    while let Some(ev) = events.recv().await {
+        if let RoomEvent::TrackSubscribed { participant, .. } = ev {
+            println!("{name}: слышу {}", participant.identity());
+        }
+    }
+}
+
+async fn record_mode(path: String, seconds: u64) {
+    let (room, mut events) = join("recorder").await;
+    let samples: Arc<Mutex<Vec<i16>>> = Arc::default();
+    let sink = samples.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            if let RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(t), participant, .. } = ev {
+                println!("записываю {}", participant.identity());
+                let mut stream = NativeAudioStream::new(t.rtc_track(), SAMPLE_RATE as i32, 1);
+                while let Some(frame) = stream.next().await {
+                    sink.lock().unwrap().extend_from_slice(&frame.data);
+                }
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    let data = samples.lock().unwrap().clone();
+    write_wav(&path, &data).expect("не удалось записать wav");
+    println!("записано {:.1} с в {path}", data.len() as f64 / SAMPLE_RATE as f64);
+    room.close().await.ok();
+}
+
+fn write_wav(path: &str, data: &[i16]) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = (data.len() * 2) as u32;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + bytes).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // моно
+    f.write_all(&SAMPLE_RATE.to_le_bytes())?;
+    f.write_all(&(SAMPLE_RATE * 2).to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&bytes.to_le_bytes())?;
+    for s in data {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    f.flush()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("latency") => latency_mode().await,
         Some("peer") => peer_mode(args.get(1).cloned().unwrap_or_else(|| "peer".into())).await,
-        _ => eprintln!("использование: feather-voice-proto latency | peer <имя>"),
+        Some("device") => device_mode(args.get(1).cloned().unwrap_or_else(|| "device".into())).await,
+        Some("record") => {
+            let path = args.get(1).cloned().unwrap_or_else(|| "record.wav".into());
+            let secs = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+            record_mode(path, secs).await
+        }
+        _ => eprintln!("использование: feather-voice-proto latency | peer <имя> | device <имя> | record <файл> <секунд>"),
     }
 }
