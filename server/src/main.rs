@@ -35,5 +35,6 @@ async fn serve() {
     let app = build(cfg).await.expect("не удалось подключиться к БД или применить миграции");
     let listener = tokio::net::TcpListener::bind(bind).await.expect("не удалось открыть порт");
     tracing::info!("feather-server слушает http://{bind}");
-    axum::serve(listener, app).await.expect("сервер упал");
+    // ConnectInfo: IP клиента для ограничения частоты запросов
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.expect("сервер упал");
 }

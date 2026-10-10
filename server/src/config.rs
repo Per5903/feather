@@ -13,6 +13,8 @@ pub struct Config {
     pub livekit_api_key: String,
     pub livekit_api_secret: String,
     pub session_ttl_days: i64,
+    /// Сервер стоит за обратным прокси (Caddy): IP клиента брать из X-Forwarded-For
+    pub trust_proxy: bool,
 }
 
 impl Config {
@@ -26,6 +28,7 @@ impl Config {
             livekit_api_key: var("LIVEKIT_API_KEY", "devkey"),
             livekit_api_secret: var("LIVEKIT_API_SECRET", "dev_secret_change_me_at_least_32_chars_long"),
             session_ttl_days: var("FEATHER_SESSION_TTL_DAYS", "30").parse().expect("FEATHER_SESSION_TTL_DAYS: нужно число"),
+            trust_proxy: var("FEATHER_TRUST_PROXY", "0") == "1",
         }
     }
 }

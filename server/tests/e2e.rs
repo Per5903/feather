@@ -37,7 +37,9 @@ impl TestServer {
         let app = feather_server::build(cfg).await.expect("сервер не собрался");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+        });
         Self { addr, db_name, http: reqwest::Client::new() }
     }
 
@@ -420,5 +422,32 @@ async fn gateway_ignores_unknown_ops() {
     gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
     assert_eq!(gw.next().await, ServerOp::HeartbeatAck, "соединение живо после неизвестной команды");
     drop(gw);
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn rate_limits() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await; // 2 запроса авторизации из 10
+
+    // Перебор паролей: после 10 попыток с одного IP — 429 и Retry-After
+    let wrong = LoginRequest { username: "alice".into(), password: "guess-guess".into(), device_name: None };
+    for _ in 0..8 {
+        assert_eq!(srv.post::<_, ApiError>("/auth/login", None, &wrong).await.0, StatusCode::BAD_REQUEST);
+    }
+    let resp = srv.http.post(srv.url("/auth/login")).json(&wrong).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(resp.headers().get("retry-after").is_some());
+
+    // Спам сообщениями: 5 подряд можно, шестое — 429
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "S".into() }).await;
+    let text = g.unwrap().channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let msg = SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None };
+    for _ in 0..5 {
+        assert_eq!(srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await.0, StatusCode::CREATED);
+    }
+    let (st, err) = srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(err.unwrap().code, "rate_limited");
     srv.drop_db().await;
 }

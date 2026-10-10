@@ -8,6 +8,7 @@ mod gateway;
 mod guilds;
 mod ids;
 mod messages;
+mod ratelimit;
 mod voice;
 mod voice_states;
 
@@ -26,6 +27,7 @@ pub struct AppState {
     ids: ids::Snowflakes,
     bus: bus::Bus,
     voice: voice_states::VoiceStates,
+    limiter: ratelimit::Limiter,
 }
 
 pub type Shared = Arc<AppState>;
@@ -38,6 +40,7 @@ pub async fn build(cfg: Config) -> Result<Router, sqlx::Error> {
         ids: ids::Snowflakes::new(cfg.worker_id),
         bus: bus::Bus::new(),
         voice: Default::default(),
+        limiter: Default::default(),
         db,
         cfg,
     });

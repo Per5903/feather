@@ -13,6 +13,7 @@ use crate::auth::AuthUser;
 use crate::bus::Target;
 use crate::error::{ApiResult, AppError};
 use crate::guilds::channel_for_member;
+use crate::ratelimit;
 
 const MAX_CONTENT: usize = 4000;
 const MAX_NONCE: usize = 64;
@@ -85,6 +86,7 @@ pub async fn send(
     Path(channel_id): Path<Snowflake>,
     Json(req): Json<SendMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<Message>)> {
+    st.limiter.check(&format!("msg:{}", user.id()), ratelimit::MESSAGES).map_err(AppError::rate_limited)?;
     let (channel, _) = channel_for_member(&st.db, channel_id, user.id()).await?;
     if channel.kind != ChannelKind::Text {
         return Err(AppError::BadRequest("not_text_channel", "писать можно только в текстовый канал".into()));

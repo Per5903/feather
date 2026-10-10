@@ -17,6 +17,7 @@ use sqlx::PgPool;
 
 use crate::Shared;
 use crate::error::{ApiResult, AppError, is_unique_violation};
+use crate::ratelimit::{self, ClientIp};
 
 const MIN_PASSWORD: usize = 8;
 const MAX_PASSWORD: usize = 256;
@@ -39,7 +40,8 @@ fn validate_username(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
-pub async fn register(State(st): State<Shared>, Json(req): Json<RegisterRequest>) -> ApiResult<(StatusCode, Json<User>)> {
+pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<RegisterRequest>) -> ApiResult<(StatusCode, Json<User>)> {
+    st.limiter.check(&format!("auth:{ip}"), ratelimit::AUTH).map_err(AppError::rate_limited)?;
     let username = req.username.trim().to_owned();
     validate_username(&username)?;
     if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&req.password.chars().count()) {
@@ -68,7 +70,8 @@ pub async fn register(State(st): State<Shared>, Json(req): Json<RegisterRequest>
     }
 }
 
-pub async fn login(State(st): State<Shared>, Json(req): Json<LoginRequest>) -> ApiResult<Json<LoginResponse>> {
+pub async fn login(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<LoginRequest>) -> ApiResult<Json<LoginResponse>> {
+    st.limiter.check(&format!("auth:{ip}"), ratelimit::AUTH).map_err(AppError::rate_limited)?;
     let row: Option<(i64, String, Option<String>, String)> = sqlx::query_as(
         "SELECT id, username, display_name, password_hash FROM users WHERE lower(username) = lower($1)",
     )
