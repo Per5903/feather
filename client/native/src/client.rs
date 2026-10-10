@@ -10,14 +10,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, Notifier, VoiceEvent, VoiceOptions, VoiceSession};
-use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, Snowflake, User, VoiceState, perms};
+use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, RoleRequest, Snowflake, User, VoiceState, perms};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::session::{self, Session};
 use crate::settings::{self, Settings};
 use crate::util::{color, initial, time_label, user_color};
-use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, VoiceMember};
+use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, PermItem, RoleItem, VoiceMember};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const HISTORY_LIMIT: u32 = 100;
@@ -161,6 +161,14 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_select_home(|| post(|app| app.select_home(None)));
     ui.on_message_member(|i| post(move |app| app.message_member(i as usize)));
     ui.on_kick_member(|i| post(move |app| app.ask_kick(i as usize)));
+    ui.on_open_roles(|| post(|app| app.open_roles()));
+    ui.on_select_role(|i| post(move |app| app.select_role(i as usize)));
+    ui.on_create_role(|| post(|app| app.create_role()));
+    ui.on_save_role(|| post(|app| app.save_role()));
+    ui.on_delete_role(|| post(|app| app.delete_role()));
+    ui.on_pick_role_color(|i| post(move |app| app.pick_role_color(i as usize)));
+    ui.on_member_roles(|i| post(move |app| app.open_member_roles(i as usize)));
+    ui.on_save_member_roles(|| post(|app| app.save_member_roles()));
 
     let weak = ui.as_weak();
     ui.on_create_guild_dialog(move || open_dialog(&weak, "create"));
@@ -259,6 +267,23 @@ fn voice_options(s: &Settings) -> VoiceOptions {
     }
 }
 
+/// Цвета ролей (порядок как в окне «Роли»)
+const ROLE_COLORS: [u32; 8] = [0x99aab5, 0x3ba55c, 0x6cb6ff, 0xc792ea, 0xf07178, 0xe8a14b, 0xffcb6b, 0x5ccfe6];
+
+/// Права в окне «Роли»: бит, название, пояснение
+const PERM_LIST: &[(u64, &str, &str)] = &[
+    (perms::ADMINISTRATOR, "Администратор", "Все права. Выдавайте только тем, кому доверяете как себе"),
+    (perms::MANAGE_CHANNELS, "Управлять каналами", "Создавать каналы и категории"),
+    (perms::MANAGE_ROLES, "Управлять ролями", "Создавать роли ниже своей и выдавать их"),
+    (perms::KICK_MEMBERS, "Выгонять", "Удалять участников с сервера"),
+    (perms::BAN_MEMBERS, "Банить", "Выгонять без права вернуться"),
+    (perms::MANAGE_MESSAGES, "Удалять сообщения", "Удалять чужие сообщения"),
+    (perms::CREATE_INVITE, "Приглашать", "Создавать коды приглашения"),
+    (perms::SEND_MESSAGES, "Писать сообщения", "В текстовых каналах"),
+    (perms::VOICE_CONNECT, "Заходить в голосовые", "Слушать голосовые каналы"),
+    (perms::VOICE_SPEAK, "Говорить", "Включать микрофон в голосовых каналах"),
+];
+
 /// После отпускания push-to-talk звук идёт ещё столько: не обрезаем последний слог
 const PTT_RELEASE_TAIL: Duration = Duration::from_millis(250);
 
@@ -284,6 +309,12 @@ struct App {
     member_roles: HashMap<Snowflake, Vec<Snowflake>>,
     /// Кого собираемся выгнать (ждём подтверждения)
     pending_kick: Option<Snowflake>,
+    /// Окно «Роли»: выбранная роль и выбранный цвет
+    role_selected: Option<Snowflake>,
+    role_color: usize,
+    /// Окно «Роли участника»: участник и роли, показанные в окне
+    roles_target: Option<Snowflake>,
+    roles_offered: Vec<Snowflake>,
     channel: Option<Snowflake>,
     members: Vec<User>,
     /// Сообщения открытого канала, от старых к новым
@@ -350,6 +381,10 @@ impl App {
             roles: Vec::new(),
             member_roles: HashMap::new(),
             pending_kick: None,
+            role_selected: None,
+            role_color: 0,
+            roles_target: None,
+            roles_offered: Vec::new(),
             channel: None,
             members: Vec::new(),
             messages: Vec::new(),
@@ -428,6 +463,7 @@ impl App {
         ui.set_guild_name(name.into());
         ui.set_in_dm(self.dm_mode);
         ui.set_can_invite(self.can(perms::CREATE_INVITE));
+        ui.set_can_manage_roles(!self.dm_mode && self.can(perms::MANAGE_ROLES));
         ui.set_home_unread(self.unread.values().any(|g| g.is_none()));
     }
 
@@ -507,6 +543,9 @@ impl App {
 
     /// Роли сменились: перерисовать всё, что от них зависит (цвета, кнопки, права)
     fn after_roles_changed(&mut self) {
+        if self.ui().is_some_and(|ui| ui.get_dialog() == "roles") {
+            self.refresh_roles_dialog();
+        }
         self.refresh_guilds();
         self.refresh_channels();
         self.refresh_members();
@@ -519,6 +558,7 @@ impl App {
         // Старшие роли выше, внутри — по имени
         ms.sort_by_key(|u| (std::cmp::Reverse(self.top_position(u.id)), u.username.to_lowercase()));
         let (can_kick, my_top) = (self.can(perms::KICK_MEMBERS), self.top_position(self.me.id));
+        let can_roles = !self.dm_mode && self.can(perms::MANAGE_ROLES);
         let items: Vec<Member> = ms
             .iter()
             .map(|u| Member {
@@ -527,6 +567,7 @@ impl App {
                 tint: self.user_tint(u.id),
                 can_message: u.id != self.me.id,
                 can_kick: can_kick && u.id != self.me.id && my_top > self.top_position(u.id),
+                can_roles: can_roles && (u.id == self.me.id || my_top > self.top_position(u.id)),
             })
             .collect();
         self.members_view = ms;
@@ -721,6 +762,10 @@ impl App {
                         app.member_roles = members.iter().map(|m| (m.user.id, m.roles.clone())).collect();
                         app.members = members.into_iter().map(|m: GuildMember| m.user).collect();
                         app.refresh_guilds();
+                        // Для снимков интерфейса в автотестах
+                        if std::env::var_os("FEATHER_TEST_ROLES").is_some() {
+                            app.open_roles();
+                        }
                         app.refresh_members();
                         // Открываем последний канал, где был пользователь, иначе первый текстовый
                         let remembered = session::load()
@@ -920,6 +965,163 @@ impl App {
             ui.set_dialog_switch(voice_cat);
             ui.set_dialog("channel".into());
         }
+    }
+
+    // ------------------------------------------------------------ роли
+
+    /// Роли по старшинству: от высшей к @everyone
+    fn roles_sorted(&self) -> Vec<Role> {
+        let mut rs = self.roles.clone();
+        rs.sort_by_key(|r| (std::cmp::Reverse(r.position), r.id));
+        rs
+    }
+
+    fn can_edit_role(&self, r: &Role) -> bool {
+        self.can(perms::MANAGE_ROLES) && (self.guild == Some(r.id) || self.top_position(self.me.id) > r.position)
+    }
+
+    fn open_roles(&mut self) {
+        self.role_selected = self.roles_sorted().first().map(|r| r.id);
+        self.refresh_roles_dialog();
+        if let Some(ui) = self.ui() {
+            ui.set_dialog("roles".into());
+        }
+    }
+
+    fn refresh_roles_dialog(&mut self) {
+        let Some(ui) = self.ui() else { return };
+        let rs = self.roles_sorted();
+        if !rs.iter().any(|r| Some(r.id) == self.role_selected) {
+            self.role_selected = rs.first().map(|r| r.id);
+        }
+        let items: Vec<RoleItem> = rs
+            .iter()
+            .map(|r| RoleItem {
+                name: r.name.as_str().into(),
+                tint: if r.color == 0 { slint::Color::from_rgb_u8(0x99, 0xaa, 0xb5) } else { color(r.color) },
+                selected: Some(r.id) == self.role_selected,
+                editable: self.can_edit_role(r),
+            })
+            .collect();
+        ui.set_role_items(ModelRc::new(VecModel::from(items)));
+        if let Some(r) = rs.iter().find(|r| Some(r.id) == self.role_selected) {
+            let perms_items: Vec<PermItem> = PERM_LIST
+                .iter()
+                .map(|(bit, title, hint)| PermItem { title: (*title).into(), hint: (*hint).into(), checked: r.permissions & bit != 0 })
+                .collect();
+            ui.set_perm_items(ModelRc::new(VecModel::from(perms_items)));
+            ui.set_role_name(r.name.as_str().into());
+            self.role_color = ROLE_COLORS.iter().position(|c| *c == r.color).unwrap_or(0);
+            ui.set_role_color_index(self.role_color as i32);
+            ui.set_role_is_everyone(self.guild == Some(r.id));
+            ui.set_role_editable(self.can_edit_role(r));
+        }
+    }
+
+    fn select_role(&mut self, i: usize) {
+        self.role_selected = self.roles_sorted().get(i).map(|r| r.id);
+        self.refresh_roles_dialog();
+    }
+
+    fn pick_role_color(&mut self, i: usize) {
+        self.role_color = i.min(ROLE_COLORS.len() - 1);
+        if let Some(ui) = self.ui() {
+            ui.set_role_color_index(self.role_color as i32);
+        }
+    }
+
+    fn create_role(&mut self) {
+        let Some(guild) = self.guild else { return };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            let req = RoleRequest { name: Some("новая роль".into()), color: Some(ROLE_COLORS[2]), permissions: Some(0), position: None };
+            let res = api.create_role(guild, &req).await;
+            post(move |app| match res {
+                Ok(r) => {
+                    if !app.roles.iter().any(|x| x.id == r.id) {
+                        app.roles.push(r.clone());
+                    }
+                    app.role_selected = Some(r.id);
+                    app.refresh_roles_dialog();
+                }
+                Err(e) => app.set_status(format!("Роль не создана: {e}")),
+            });
+        });
+    }
+
+    fn save_role(&mut self) {
+        let (Some(guild), Some(role), Some(ui)) = (self.guild, self.role_selected, self.ui()) else { return };
+        let items = ui.get_perm_items();
+        let bits = (0..items.row_count())
+            .filter_map(|i| items.row_data(i))
+            .zip(PERM_LIST)
+            .filter(|(item, _)| item.checked)
+            .fold(0u64, |acc, (_, (bit, _, _))| acc | bit);
+        let everyone = guild == role;
+        let req = RoleRequest {
+            name: (!everyone).then(|| ui.get_role_name().to_string()),
+            color: (!everyone).then(|| ROLE_COLORS[self.role_color]),
+            permissions: Some(bits),
+            position: None,
+        };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            match api.update_role(guild, role, &req).await {
+                Ok(_) => post(|app| app.set_status("Роль сохранена")),
+                Err(e) => post(move |app| app.set_status(format!("Роль не сохранена: {e}"))),
+            }
+        });
+    }
+
+    fn delete_role(&mut self) {
+        let (Some(guild), Some(role)) = (self.guild, self.role_selected) else { return };
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = api.delete_role(guild, role).await {
+                post(move |app| app.set_status(format!("Роль не удалена: {e}")));
+            }
+        });
+    }
+
+    fn open_member_roles(&mut self, i: usize) {
+        let Some(u) = self.members_view.get(i).cloned() else { return };
+        let my_top = self.top_position(self.me.id);
+        let has = self.member_roles.get(&u.id).cloned().unwrap_or_default();
+        let offered: Vec<Role> = self.roles_sorted().into_iter().filter(|r| Some(r.id) != self.guild && my_top > r.position).collect();
+        let items: Vec<PermItem> = offered
+            .iter()
+            .map(|r| PermItem { title: r.name.as_str().into(), hint: SharedString::new(), checked: has.contains(&r.id) })
+            .collect();
+        self.roles_target = Some(u.id);
+        self.roles_offered = offered.iter().map(|r| r.id).collect();
+        if let Some(ui) = self.ui() {
+            ui.set_roles_member_name(u.username.as_str().into());
+            ui.set_member_role_items(ModelRc::new(VecModel::from(items)));
+            ui.set_dialog("member-roles".into());
+        }
+    }
+
+    fn save_member_roles(&mut self) {
+        let (Some(guild), Some(user), Some(ui)) = (self.guild, self.roles_target, self.ui()) else { return };
+        ui.set_dialog(SharedString::new());
+        let items = ui.get_member_role_items();
+        let has = self.member_roles.get(&user).cloned().unwrap_or_default();
+        let changes: Vec<(Snowflake, bool)> = self
+            .roles_offered
+            .iter()
+            .enumerate()
+            .filter_map(|(i, role)| items.row_data(i).map(|it| (*role, it.checked)))
+            .filter(|(role, want)| has.contains(role) != *want)
+            .collect();
+        let api = self.api.clone();
+        self.rt.spawn(async move {
+            for (role, add) in changes {
+                if let Err(e) = api.set_member_role(guild, user, role, add).await {
+                    post(move |app| app.set_status(format!("Роль не изменена: {e}")));
+                    break;
+                }
+            }
+        });
     }
 
     fn ask_kick(&mut self, i: usize) {

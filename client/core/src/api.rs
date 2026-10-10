@@ -145,6 +145,24 @@ impl Api {
         self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/roles"), None).await
     }
 
+    pub async fn create_role(&self, guild: Snowflake, req: &RoleRequest) -> Result<Role> {
+        self.call(Method::POST, &format!("/guilds/{guild}/roles"), Some(req)).await
+    }
+
+    pub async fn update_role(&self, guild: Snowflake, role: Snowflake, req: &RoleRequest) -> Result<Role> {
+        self.call(Method::PATCH, &format!("/guilds/{guild}/roles/{role}"), Some(req)).await
+    }
+
+    pub async fn delete_role(&self, guild: Snowflake, role: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/guilds/{guild}/roles/{role}"), None).await
+    }
+
+    /// Выдать (`add`) или снять роль у участника
+    pub async fn set_member_role(&self, guild: Snowflake, user: Snowflake, role: Snowflake, add: bool) -> Result<()> {
+        let method = if add { Method::PUT } else { Method::DELETE };
+        self.call::<(), ()>(method, &format!("/guilds/{guild}/members/{user}/roles/{role}"), None).await
+    }
+
     /// Выгнать участника (или выйти самому, если это я)
     pub async fn kick(&self, guild: Snowflake, user: Snowflake) -> Result<()> {
         self.call::<(), ()>(Method::DELETE, &format!("/guilds/{guild}/members/{user}"), None).await

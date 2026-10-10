@@ -98,7 +98,7 @@ pub fn run(ui: &AppWindow) -> Vec<Timer> {
         ch("AFK", ChannelKind::Voice, false),
     ])));
     ui.set_members(ModelRc::new(VecModel::from(
-        users.iter().map(|u| Member { name: u.name.into(), initial: initial(u.name), tint: color(u.color), can_message: false, can_kick: false }).collect::<Vec<_>>(),
+        users.iter().map(|u| Member { name: u.name.into(), initial: initial(u.name), tint: color(u.color), can_message: false, can_kick: false, can_roles: false }).collect::<Vec<_>>(),
     )));
     ui.set_me_name(users[0].name.into());
     ui.set_me_initial(initial(users[0].name));

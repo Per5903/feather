@@ -31,6 +31,8 @@ export struct Member {
     can-message: bool,
     /// Показывать кнопку «Выгнать» (есть право и я выше по роли)
     can-kick: bool,
+    /// Показывать кнопку «Роли» (могу выдавать роли)
+    can-roles: bool,
 }
 
 export struct GuildItem {
@@ -59,6 +61,20 @@ export struct ChannelItem {
     voice-members: [VoiceMember],
     /// У категории кнопка «+» (создать канал) — только тем, кто может
     can-add: bool,
+}
+
+export struct RoleItem {
+    name: string,
+    tint: color,
+    selected: bool,
+    /// Можно редактировать (ниже моей роли)
+    editable: bool,
+}
+
+export struct PermItem {
+    title: string,
+    hint: string,
+    checked: bool,
 }
 
 global Theme {
@@ -570,6 +586,155 @@ component SettingsDialog inherits Rectangle {
     }
 }
 
+/// Окно «Роли сервера»: список ролей слева, свойства выбранной справа
+component RolesDialog inherits Rectangle {
+    in property <[RoleItem]> roles;
+    in property <[PermItem]> perm-items;
+    in-out property <string> role-name;
+    in property <int> color-index;
+    in property <bool> is-everyone;
+    in property <bool> editable;
+    callback select-role(int);
+    callback create-role();
+    callback save-role();
+    callback delete-role();
+    callback pick-color(int);
+    callback close();
+    background: #000000a8;
+    TouchArea { }
+    Rectangle {
+        width: 640px;
+        height: 520px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg1;
+        border-radius: 10px;
+        HorizontalLayout {
+            // Список ролей
+            Rectangle {
+                width: 200px;
+                background: Theme.bg0;
+                border-radius: 10px;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 4px;
+                    Text { text: "Роли"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                    for r[i] in roles: rta := TouchArea {
+                        height: 32px;
+                        clicked => { root.select-role(i); }
+                        Rectangle {
+                            border-radius: 4px;
+                            background: r.selected ? Theme.active : rta.has-hover ? Theme.hover : transparent;
+                        }
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle { width: 10px; height: 10px; border-radius: 5px; background: r.tint; }
+                            }
+                            Text { text: r.name; color: r.tint; vertical-alignment: center; overflow: elide; }
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Button { text: "Создать роль"; clicked => { root.create-role(); } }
+                }
+            }
+            // Свойства роли
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                if !is-everyone: Field {
+                    label: "НАЗВАНИЕ";
+                    LineEdit { text <=> root.role-name; enabled: editable; }
+                }
+                if is-everyone: Text {
+                    text: "@everyone — права всех участников сервера";
+                    color: Theme.dim;
+                    wrap: word-wrap;
+                }
+                if !is-everyone: Field {
+                    label: "ЦВЕТ";
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        for c[i] in [#99aab5, #3ba55c, #6cb6ff, #c792ea, #f07178, #e8a14b, #ffcb6b, #5ccfe6]: Rectangle {
+                            width: 24px;
+                            height: 24px;
+                            border-radius: 12px;
+                            background: c;
+                            border-width: i == color-index ? 3px : 0px;
+                            border-color: Theme.text;
+                            TouchArea { clicked => { if (editable) { root.pick-color(i); } } }
+                        }
+                    }
+                }
+                Text { text: "ПРАВА"; color: Theme.dim; font-size: 12px; font-weight: 600; }
+                Flickable {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for p in perm-items: HorizontalLayout {
+                            spacing: 12px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: p.title; color: Theme.text; }
+                                Text { text: p.hint; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch { checked <=> p.checked; enabled: editable; }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    if !is-everyone && editable: Button { text: "Удалить"; clicked => { root.delete-role(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Закрыть"; clicked => { root.close(); } }
+                    if editable: Button { text: "Сохранить"; primary: true; clicked => { root.save-role(); } }
+                }
+            }
+        }
+    }
+}
+
+/// Окно «Роли участника»: переключатели ролей
+component MemberRolesDialog inherits Rectangle {
+    in property <string> member-name;
+    in property <[PermItem]> items;
+    callback save();
+    callback close();
+    background: #000000a8;
+    TouchArea { }
+    Rectangle {
+        width: 380px;
+        height: box.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg1;
+        border-radius: 10px;
+        box := VerticalLayout {
+            padding: 22px;
+            spacing: 10px;
+            Text { text: "Роли: " + member-name; color: Theme.text; font-size: 18px; font-weight: 700; }
+            if items.length == 0: Text { text: "Нет ролей, которые вы можете выдавать."; color: Theme.dim; wrap: word-wrap; }
+            for it in items: HorizontalLayout {
+                spacing: 12px;
+                Text { text: it.title; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+                Switch { checked <=> it.checked; }
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Button { text: "Отмена"; clicked => { root.close(); } }
+                Button { text: "Сохранить"; primary: true; clicked => { root.save(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Feather";
     preferred-width: 1280px;
@@ -614,6 +779,24 @@ export component AppWindow inherits Window {
     callback message-member(int);
     callback kick-member(int);
     in property <bool> can-invite;
+    // ---- роли
+    in property <bool> can-manage-roles;
+    in property <[RoleItem]> role-items;
+    in property <[PermItem]> perm-items;
+    in-out property <string> role-name;
+    in property <int> role-color-index;
+    in property <bool> role-is-everyone;
+    in property <bool> role-editable;
+    in property <string> roles-member-name;
+    in property <[PermItem]> member-role-items;
+    callback open-roles();
+    callback select-role(int);
+    callback create-role();
+    callback save-role();
+    callback delete-role();
+    callback pick-role-color(int);
+    callback member-roles(int);
+    callback save-member-roles();
 
     // ---- голос
     /// Название голосового канала, к которому подключены; "" — не подключены
@@ -815,6 +998,14 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             overflow: elide;
                             horizontal-stretch: 1;
+                        }
+                        if guild-name != "" && !in-dm && can-manage-roles: VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // «Роли сервера»: щит
+                                icon: "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z";
+                                clicked => { root.open-roles(); }
+                            }
                         }
                         if guild-name != "" && !in-dm && can-invite: VerticalLayout {
                             alignment: center;
@@ -1098,6 +1289,13 @@ export component AppWindow inherits Window {
                                 clicked => { root.message-member(i); }
                             }
                         }
+                        if u.can-roles && mta.has-hover: VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                icon: "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z";
+                                clicked => { root.member-roles(i); }
+                            }
+                        }
                         if u.can-kick && mta.has-hover: VerticalLayout {
                             alignment: center;
                             IconButton {
@@ -1152,6 +1350,26 @@ export component AppWindow inherits Window {
         value <=> root.dialog-value;
         ok => { root.dialog-ok(); }
         cancel => { root.dialog = ""; }
+    }
+    if dialog == "roles": RolesDialog {
+        roles: root.role-items;
+        perm-items: root.perm-items;
+        role-name <=> root.role-name;
+        color-index: root.role-color-index;
+        is-everyone: root.role-is-everyone;
+        editable: root.role-editable;
+        select-role(i) => { root.select-role(i); }
+        create-role => { root.create-role(); }
+        save-role => { root.save-role(); }
+        delete-role => { root.delete-role(); }
+        pick-color(i) => { root.pick-role-color(i); }
+        close => { root.dialog = ""; }
+    }
+    if dialog == "member-roles": MemberRolesDialog {
+        member-name: root.roles-member-name;
+        items: root.member-role-items;
+        save => { root.save-member-roles(); }
+        close => { root.dialog = ""; }
     }
     if dialog == "kick": Dialog {
         title: "Выгнать участника?";
