@@ -9,6 +9,7 @@ mod guilds;
 mod ids;
 mod messages;
 mod voice;
+mod voice_states;
 
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ pub struct AppState {
     pub cfg: Config,
     ids: ids::Snowflakes,
     bus: bus::Bus,
+    voice: voice_states::VoiceStates,
 }
 
 pub type Shared = Arc<AppState>;
@@ -32,7 +34,13 @@ pub type Shared = Arc<AppState>;
 pub async fn build(cfg: Config) -> Result<Router, sqlx::Error> {
     let db = PgPoolOptions::new().max_connections(20).connect(&cfg.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
-    let state = Arc::new(AppState { ids: ids::Snowflakes::new(cfg.worker_id), bus: bus::Bus::new(), db, cfg });
+    let state = Arc::new(AppState {
+        ids: ids::Snowflakes::new(cfg.worker_id),
+        bus: bus::Bus::new(),
+        voice: Default::default(),
+        db,
+        cfg,
+    });
     Ok(router(state))
 }
 

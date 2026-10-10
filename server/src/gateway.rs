@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
-use feather_protocol::{ClientOp, Event, ServerOp, Snowflake};
+use feather_protocol::{ChannelKind, ClientOp, Event, ServerOp, Snowflake, User, VoiceState};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, interval_at, timeout};
@@ -18,7 +18,7 @@ use tokio::time::{Instant, interval_at, timeout};
 use crate::Shared;
 use crate::auth::user_by_token;
 use crate::bus::{Envelope, Target};
-use crate::guilds::user_guilds;
+use crate::guilds::{channel_for_member, user_guilds};
 use crate::messages::unread_channels;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -40,10 +40,41 @@ pub struct GatewayQuery {
 
 pub async fn upgrade(State(st): State<Shared>, Query(q): Query<GatewayQuery>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = Session::run(st, socket, q.encoding).await {
+        let mut who = None;
+        if let Err(e) = Session::run(st.clone(), socket, q.encoding, &mut who).await {
             tracing::debug!("шлюз: соединение закрыто: {e}");
         }
+        // Сессия закрылась (выход, обрыв, падение клиента): убираем человека из голосового канала
+        if let Some((session_id, user)) = who
+            && let Some(left) = st.voice.session_closed(&session_id, user)
+        {
+            st.bus.publish(Target::Guild(left.guild_id), Event::VoiceStateUpdate(left));
+        }
     })
+}
+
+/// Голосовое состояние от клиента: проверяем канал и рассылаем участникам сервера
+async fn voice_state(st: &Shared, session_id: &str, user: &User, channel_id: Option<Snowflake>, muted: bool, deafened: bool) -> Result<(), String> {
+    let guild_id = match channel_id {
+        Some(cid) => {
+            let (channel, _) = channel_for_member(&st.db, cid, user.id).await.map_err(|e| format!("{e:?}"))?;
+            if channel.kind != ChannelKind::Voice {
+                return Ok(()); // не голосовой канал — молча игнорируем
+            }
+            channel.guild_id
+        }
+        // Выход: сервер, в котором человек был
+        None => match st.voice.current_guild(user.id) {
+            Some(g) => g,
+            None => return Ok(()),
+        },
+    };
+    let state = VoiceState { guild_id, channel_id, user: user.clone(), muted, deafened };
+    if let Some(left) = st.voice.set(session_id, state.clone()) {
+        st.bus.publish(Target::Guild(left.guild_id), Event::VoiceStateUpdate(left));
+    }
+    st.bus.publish(Target::Guild(guild_id), Event::VoiceStateUpdate(state));
+    Ok(())
 }
 
 struct Session {
@@ -70,11 +101,20 @@ impl Session {
     }
 
     fn decode(&self, msg: WsMessage) -> Option<Result<ClientOp, String>> {
-        match msg {
-            WsMessage::Binary(b) => Some(rmp_serde::from_slice(&b).map_err(|e| e.to_string())),
-            WsMessage::Text(t) => Some(serde_json::from_str(&t).map_err(|e| e.to_string())),
-            WsMessage::Close(_) => Some(Err("клиент закрыл соединение".into())),
-            _ => None, // ping/pong обрабатывает axum
+        let op = match msg {
+            WsMessage::Binary(b) => rmp_serde::from_slice(&b).map_err(|e| e.to_string()),
+            WsMessage::Text(t) => serde_json::from_str(&t).map_err(|e| e.to_string()),
+            WsMessage::Close(_) => return Some(Err("клиент закрыл соединение".into())),
+            _ => return None, // ping/pong обрабатывает axum
+        };
+        match op {
+            Ok(op) => Some(Ok(op)),
+            // Неизвестная команда (клиент новее сервера) — пропускаем, а не рвём соединение:
+            // иначе клиент переподключается и присылает её снова, бесконечно
+            Err(e) => {
+                tracing::debug!("шлюз: пропущена непонятная команда: {e}");
+                None
+            }
         }
     }
 
@@ -90,7 +130,7 @@ impl Session {
         }
     }
 
-    async fn run(st: Shared, ws: WebSocket, enc: Encoding) -> SessionResult {
+    async fn run(st: Shared, ws: WebSocket, enc: Encoding, who: &mut Option<(String, Snowflake)>) -> SessionResult {
         let mut s = Session { ws, enc, seq: 0 };
         // Подписываемся на шину до READY, чтобы не потерять события между ними
         let mut bus = st.bus.subscribe();
@@ -116,8 +156,12 @@ impl Session {
 
         let mut session_id = [0u8; 12];
         getrandom::fill(&mut session_id).map_err(|e| e.to_string())?;
-        let session_id = session_id.iter().map(|b| format!("{b:02x}")).collect();
-        s.send(&ServerOp::Ready { session_id, user, guilds, unread }).await?;
+        let session_id: String = session_id.iter().map(|b| format!("{b:02x}")).collect();
+        *who = Some((session_id.clone(), user.id));
+        let guild_ids: Vec<Snowflake> = guilds.iter().map(|g| g.id).collect();
+        let voice_states = st.voice.for_guilds(&guild_ids);
+        let me_user = user.clone();
+        s.send(&ServerOp::Ready { session_id: session_id.clone(), user, guilds, unread, voice_states }).await?;
         tracing::debug!("шлюз: пользователь {me} подключён");
 
         // Клиент шлёт HEARTBEAT раз в интервал; два пропуска подряд — соединение мёртвое
@@ -142,6 +186,9 @@ impl Session {
                             subscribed.remove(&guild_id);
                         }
                         ClientOp::ClientState { background: b } => background = b,
+                        ClientOp::VoiceState { channel_id, muted, deafened } => {
+                            voice_state(&st, &session_id, &me_user, channel_id, muted, deafened).await?;
+                        }
                         ClientOp::Identify { .. } => return Err("повторный IDENTIFY".into()),
                     },
                 },

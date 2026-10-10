@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use feather_core::{Api, GatewayEvent, GatewayHandle, VoiceEvent, VoiceOptions, VoicePeer, VoiceSession};
-use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, Event, Guild, Message, Snowflake, User};
+use feather_core::{Api, GatewayEvent, GatewayHandle, VoiceEvent, VoiceOptions, VoiceSession};
+use feather_protocol::{Channel, ChannelKind as Kind, ClientOp, Event, Guild, Message, Snowflake, User, VoiceState};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
@@ -194,7 +194,6 @@ struct Voice {
     /// None — ещё подключаемся
     session: Option<VoiceSession>,
     me: String,
-    peers: Vec<VoicePeer>,
     speaking: Vec<String>,
     muted: bool,
     deafened: bool,
@@ -237,6 +236,8 @@ struct App {
     has_older: bool,
     voice: Option<Voice>,
     voice_seq: u64,
+    /// Кто в голосовых каналах (по данным сервера): пользователь → состояние
+    voice_states: HashMap<Snowflake, VoiceState>,
 }
 
 impl App {
@@ -275,6 +276,7 @@ impl App {
             has_older: false,
             voice: None,
             voice_seq: 0,
+            voice_states: HashMap::new(),
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
     }
@@ -339,22 +341,37 @@ impl App {
     }
 
     fn voice_members(&self, channel: Snowflake) -> ModelRc<VoiceMember> {
-        let Some(v) = self.voice.as_ref().filter(|v| v.channel == channel) else { return ModelRc::default() };
-        let me = VoicePeer { identity: v.me.clone(), name: self.me.username.clone() };
-        let rows: Vec<VoiceMember> = std::iter::once(&me)
-            .chain(v.peers.iter())
-            .map(|p| {
-                let id = p.identity.parse().map(Snowflake).unwrap_or(Snowflake(0));
+        let mut states: Vec<&VoiceState> = self.voice_states.values().filter(|v| v.channel_id == Some(channel)).collect();
+        if states.is_empty() {
+            return ModelRc::default();
+        }
+        states.sort_by_key(|v| v.user.username.to_lowercase());
+        // Кто говорит — знаем, только если сами в этом канале (данные LiveKit)
+        let speaking = self.voice.as_ref().filter(|v| v.channel == channel).map(|v| &v.speaking);
+        let rows: Vec<VoiceMember> = states
+            .into_iter()
+            .map(|v| {
+                let name = v.user.display_name.as_deref().unwrap_or(&v.user.username);
                 VoiceMember {
-                    name: p.name.as_str().into(),
-                    initial: initial(&p.name),
-                    tint: user_color(id),
-                    speaking: v.speaking.contains(&p.identity),
-                    muted: p.identity == v.me && (v.muted || v.deafened),
+                    name: name.into(),
+                    initial: initial(name),
+                    tint: user_color(v.user.id),
+                    speaking: speaking.is_some_and(|s| s.contains(&v.user.id.to_string())),
+                    muted: v.muted || v.deafened,
                 }
             })
             .collect();
         ModelRc::new(VecModel::from(rows))
+    }
+
+    /// Сообщить серверу своё голосовое состояние (его увидят все участники сервера)
+    fn send_voice_state(&self) {
+        let op = match &self.voice {
+            Some(v) if v.session.is_some() => ClientOp::VoiceState { channel_id: Some(v.channel), muted: v.muted, deafened: v.deafened },
+            Some(_) => return, // ещё подключаемся
+            None => ClientOp::VoiceState { channel_id: None, muted: false, deafened: false },
+        };
+        self.gw_send(op);
     }
 
     fn refresh_voice(&self) {
@@ -609,9 +626,12 @@ impl App {
 
     fn on_gateway(&mut self, ev: GatewayEvent) {
         match ev {
-            GatewayEvent::Ready { user, guilds, unread } => {
+            GatewayEvent::Ready { user, guilds, unread, voice_states } => {
                 self.me = user;
                 self.guilds = guilds;
+                self.voice_states = voice_states.into_iter().filter(|v| v.channel_id.is_some()).map(|v| (v.user.id, v)).collect();
+                // Переподключение шлюза: сервер забыл наше голосовое состояние вместе со старой сессией
+                self.send_voice_state();
                 self.unread = unread.into_iter().map(|u| (u.channel_id, u.guild_id)).collect();
                 if let Some(c) = self.channel {
                     self.unread.remove(&c);
@@ -707,6 +727,14 @@ impl App {
                     self.refresh_guilds();
                 }
             }
+            Event::VoiceStateUpdate(v) => {
+                if v.channel_id.is_some() {
+                    self.voice_states.insert(v.user.id, v);
+                } else {
+                    self.voice_states.remove(&v.user.id);
+                }
+                self.refresh_channels();
+            }
             Event::ChannelAck { channel_id, .. } => {
                 // Дочитано на другом устройстве
                 if self.unread.remove(&channel_id).is_some() {
@@ -731,7 +759,6 @@ impl App {
             channel_name: c.name.clone(),
             session: None,
             me: self.me.id.to_string(),
-            peers: Vec::new(),
             speaking: Vec::new(),
             // FEATHER_START_MUTED=1 — заходить с выключенным микрофоном
             muted: std::env::var_os("FEATHER_START_MUTED").is_some(),
@@ -753,6 +780,7 @@ impl App {
                         session.set_deafened(v.deafened);
                         v.session = Some(session);
                         app.refresh_voice();
+                        app.send_voice_state();
                     }
                     // Пользователь уже ушёл из канала, пока мы подключались
                     (Ok(session), None) => {
@@ -773,15 +801,9 @@ impl App {
     fn on_voice(&mut self, id: u64, ev: VoiceEvent) {
         let Some(v) = self.voice.as_mut().filter(|v| v.id == id) else { return };
         match ev {
-            VoiceEvent::Joined { me, peers } => {
-                v.me = me;
-                v.peers = peers;
-            }
-            VoiceEvent::PeerJoined(p) => {
-                v.peers.retain(|x| x.identity != p.identity);
-                v.peers.push(p);
-            }
-            VoiceEvent::PeerLeft(identity) => v.peers.retain(|x| x.identity != identity),
+            VoiceEvent::Joined { me, .. } => v.me = me,
+            // Список участников берём с сервера (VOICE_STATE), а не из LiveKit
+            VoiceEvent::PeerJoined(_) | VoiceEvent::PeerLeft(_) => return,
             VoiceEvent::Speaking(who) => v.speaking = who,
             VoiceEvent::Warning(w) => {
                 self.set_status(w);
@@ -789,6 +811,7 @@ impl App {
             }
             VoiceEvent::Disconnected(reason) => {
                 self.voice = None;
+                self.send_voice_state();
                 self.set_status(format!("Голос отключён ({reason})"));
             }
         }
@@ -809,6 +832,7 @@ impl App {
             s.set_deafened(v.deafened);
         }
         self.refresh_voice();
+        self.send_voice_state();
     }
 
     fn toggle_deafen(&mut self) {
@@ -818,13 +842,14 @@ impl App {
             s.set_deafened(v.deafened);
         }
         self.refresh_voice();
+        self.send_voice_state();
     }
 
     fn leave_voice(&mut self) {
-        if let Some(v) = self.voice.take()
-            && let Some(session) = v.session
-        {
+        let was = self.voice.take();
+        if let Some(session) = was.and_then(|v| v.session) {
             self.rt.spawn(session.leave());
+            self.send_voice_state();
         }
         self.refresh_voice();
     }

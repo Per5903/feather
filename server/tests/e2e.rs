@@ -341,3 +341,84 @@ async fn read_states() {
     drop(bob_gw);
     srv.drop_db().await;
 }
+
+#[tokio::test]
+async fn voice_states() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "V".into() }).await;
+    let g = g.unwrap();
+    let voice = g.channels.iter().find(|c| c.kind == ChannelKind::Voice).unwrap().id;
+    let text = g.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{}/invites", g.guild.id), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", inv.unwrap().code), Some(&bob.token), &()).await;
+
+    // Bob видит голосовые состояния сервера, даже не открыв его (лёгкое событие)
+    let (mut bob_gw, _) = GatewayClient::connect(srv.addr, &bob.token).await;
+    let (mut alice_gw, _) = GatewayClient::connect(srv.addr, &alice.token).await;
+    alice_gw.send(&ClientOp::VoiceState { channel_id: Some(voice), muted: false, deafened: false }).await;
+    match bob_gw.next_event().await {
+        Event::VoiceStateUpdate(v) => {
+            assert_eq!((v.channel_id, v.user.username.as_str(), v.muted), (Some(voice), "alice", false));
+        }
+        other => panic!("ожидался VOICE_STATE_UPDATE, пришло {other:?}"),
+    }
+
+    // Микрофон выключен — тоже событие
+    alice_gw.send(&ClientOp::VoiceState { channel_id: Some(voice), muted: true, deafened: false }).await;
+    assert!(matches!(bob_gw.next_event().await, Event::VoiceStateUpdate(v) if v.muted));
+
+    // Новый клиент получает состояние сразу в READY
+    let (_, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
+    match ready {
+        ServerOp::Ready { voice_states, .. } => {
+            assert_eq!(voice_states.len(), 1);
+            assert_eq!(voice_states[0].channel_id, Some(voice));
+        }
+        other => panic!("ожидался READY, пришло {other:?}"),
+    }
+
+    // Текстовый канал как голосовой не принимается
+    alice_gw.send(&ClientOp::VoiceState { channel_id: Some(text), muted: false, deafened: false }).await;
+    alice_gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
+    // Свои голосовые события Alice тоже получает (для других её устройств) — пропускаем их
+    loop {
+        match alice_gw.next().await {
+            ServerOp::HeartbeatAck => break,
+            ServerOp::Dispatch { event: Event::VoiceStateUpdate(v), .. } => {
+                assert_ne!(v.channel_id, Some(text), "текстовый канал не голосовой");
+            }
+            other => panic!("неожиданно: {other:?}"),
+        }
+    }
+
+    // Клиент Alice «упал»: сессия закрыта — Bob видит, что она вышла из канала
+    drop(alice_gw);
+    match bob_gw.next_event().await {
+        Event::VoiceStateUpdate(v) => assert_eq!((v.channel_id, v.user.username.as_str()), (None, "alice")),
+        other => panic!("ожидался выход из голоса, пришло {other:?}"),
+    }
+
+    drop(bob_gw);
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn gateway_ignores_unknown_ops() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let (mut gw, ready) = GatewayClient::connect(srv.addr, &alice.token).await;
+    assert!(matches!(ready, ServerOp::Ready { .. }));
+    // Команда из будущей версии клиента
+    #[derive(Serialize)]
+    struct Future {
+        op: &'static str,
+        d: u32,
+    }
+    gw.ws.send(Ws::Binary(rmp_serde::to_vec_named(&Future { op: "TELEPORT", d: 42 }).unwrap().into())).await.unwrap();
+    gw.send(&ClientOp::Heartbeat { seq: 0 }).await;
+    assert_eq!(gw.next().await, ServerOp::HeartbeatAck, "соединение живо после неизвестной команды");
+    drop(gw);
+    srv.drop_db().await;
+}

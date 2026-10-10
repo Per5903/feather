@@ -193,6 +193,16 @@ pub struct UnreadChannel {
     pub last_message_id: Snowflake,
 }
 
+/// Кто в каком голосовом канале (`channel_id: None` — вышел)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct VoiceState {
+    pub guild_id: Snowflake,
+    pub channel_id: Option<Snowflake>,
+    pub user: User,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VoiceJoinResponse {
     /// Адрес LiveKit для клиента
@@ -220,6 +230,8 @@ pub enum ClientOp {
     UnsubscribeGuild { guild_id: Snowflake },
     /// Игровой режим: не присылать typing/presence, пока окно скрыто
     ClientState { background: bool },
+    /// Я зашёл в голосовой канал / вышел (None) / переключил микрофон или звук
+    VoiceState { channel_id: Option<Snowflake>, muted: bool, deafened: bool },
 }
 
 /// Сервер → клиент
@@ -234,6 +246,9 @@ pub enum ServerOp {
         /// Каналы с непрочитанным на момент подключения
         #[serde(default)]
         unread: Vec<UnreadChannel>,
+        /// Кто сейчас в голосовых каналах серверов пользователя
+        #[serde(default)]
+        voice_states: Vec<VoiceState>,
     },
     HeartbeatAck,
     Dispatch { seq: u64, event: Event },
@@ -251,6 +266,7 @@ pub enum Event {
     GuildMemberAdd { guild_id: Snowflake, user: User },
     /// Новый сервер, в котором пользователь теперь состоит (создал или вступил)
     GuildCreate(Guild),
+    VoiceStateUpdate(VoiceState),
     /// Пользователь дочитал канал (на этом или другом своём устройстве)
     ChannelAck { channel_id: Snowflake, message_id: Snowflake },
     /// По неподписанным серверам приходят только счётчики
@@ -261,7 +277,7 @@ pub enum Event {
 impl Event {
     /// Полное событие или «лёгкое» (для серверов без подписки)
     pub fn is_heavy(&self) -> bool {
-        !matches!(self, Event::GuildCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. })
+        !matches!(self, Event::GuildCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
     }
 }
 
