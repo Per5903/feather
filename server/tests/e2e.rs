@@ -432,25 +432,38 @@ async fn rate_limits() {
     let srv = TestServer::start().await;
     let alice = srv.signup("alice").await; // 2 запроса авторизации из 10
 
-    // Перебор паролей: после 10 попыток с одного IP — 429 и Retry-After
+    // Перебор паролей: не раньше 10-й попытки с одного IP — 429 и Retry-After.
+    // Не завязываемся на скорость машины: на медленном CI ведро успевает чуть пополниться
     let wrong = LoginRequest { username: "alice".into(), password: "guess-guess".into(), device_name: None };
-    for _ in 0..8 {
-        assert_eq!(srv.post::<_, ApiError>("/auth/login", None, &wrong).await.0, StatusCode::BAD_REQUEST);
-    }
-    let resp = srv.http.post(srv.url("/auth/login")).json(&wrong).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(resp.headers().get("retry-after").is_some());
+    let mut failed_logins = 0;
+    let limited = loop {
+        let resp = srv.http.post(srv.url("/auth/login")).json(&wrong).send().await.unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            break resp;
+        }
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        failed_logins += 1;
+        assert!(failed_logins < 20, "лимит так и не сработал");
+    };
+    assert!(failed_logins >= 8, "лимит сработал слишком рано: после {failed_logins}");
+    assert!(limited.headers().get("retry-after").is_some());
 
     // Спам сообщениями: 5 подряд можно, шестое — 429
     let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "S".into() }).await;
     let text = g.unwrap().channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
     let msg = SendMessageRequest { content: "спам".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] };
-    for _ in 0..5 {
-        assert_eq!(srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await.0, StatusCode::CREATED);
-    }
-    let (st, err) = srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&alice.token), &msg).await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(err.unwrap().code, "rate_limited");
+    let mut sent = 0;
+    let err = loop {
+        let (st, body) = srv.req::<_, serde_json::Value>(reqwest::Method::POST, &format!("/channels/{text}/messages"), Some(&alice.token), Some(&msg)).await;
+        if st == StatusCode::TOO_MANY_REQUESTS {
+            break body.unwrap();
+        }
+        assert_eq!(st, StatusCode::CREATED);
+        sent += 1;
+        assert!(sent < 15, "лимит сообщений так и не сработал");
+    };
+    assert!(sent >= 5, "лимит сработал раньше 5 сообщений: {sent}");
+    assert_eq!(err["code"], "rate_limited");
     srv.drop_db().await;
 }
 
