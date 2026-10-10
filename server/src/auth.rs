@@ -22,10 +22,50 @@ use crate::ratelimit::{self, ClientIp};
 const MIN_PASSWORD: usize = 8;
 const MAX_PASSWORD: usize = 256;
 
-pub type UserRow = (i64, String, Option<String>);
+pub type UserRow = (i64, String, Option<String>, Option<i64>);
 
-pub fn user_from_row((id, username, display_name): UserRow) -> User {
-    User { id: Snowflake(id as u64), username, display_name }
+pub fn user_from_row((id, username, display_name, avatar): UserRow) -> User {
+    User { id: Snowflake(id as u64), username, display_name, avatar: avatar.map(|a| Snowflake(a as u64)) }
+}
+
+pub async fn load_user(db: &PgPool, id: Snowflake) -> ApiResult<User> {
+    let row: Option<UserRow> = sqlx::query_as("SELECT u.id, u.username, u.display_name, u.avatar_id FROM users u WHERE u.id = $1")
+        .bind(id.0 as i64)
+        .fetch_optional(db)
+        .await?;
+    row.map(user_from_row).ok_or(AppError::NotFound("пользователь"))
+}
+
+/// Режим регистрации: из панели администратора, иначе из FEATHER_REGISTRATION
+pub async fn registration_mode(st: &Shared) -> ApiResult<RegistrationMode> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM instance_settings WHERE key = 'registration'").fetch_optional(&st.db).await?;
+    Ok(match row.as_ref().map(|r| r.0.as_str()) {
+        Some("open") => RegistrationMode::Open,
+        Some("invite") => RegistrationMode::Invite,
+        Some("closed") => RegistrationMode::Closed,
+        _ => st.cfg.registration,
+    })
+}
+
+pub async fn hash_password(password: String) -> ApiResult<String> {
+    // Argon2 намеренно медленный — не блокируем им рантайм
+    tokio::task::spawn_blocking(move || Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string()))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(format!("argon2: {e}")))
+}
+
+pub async fn verify_password(password: String, hash: String) -> ApiResult<bool> {
+    tokio::task::spawn_blocking(move || PasswordHash::new(&hash).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok()))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+pub fn validate_password(p: &str) -> ApiResult<()> {
+    if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&p.chars().count()) {
+        return Err(AppError::BadRequest("bad_password", format!("пароль: от {MIN_PASSWORD} символов")));
+    }
+    Ok(())
 }
 
 fn validate_username(name: &str) -> ApiResult<()> {
@@ -43,7 +83,7 @@ fn validate_username(name: &str) -> ApiResult<()> {
 pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<RegisterRequest>) -> ApiResult<(StatusCode, Json<User>)> {
     st.limiter.check(&format!("auth:{ip}"), ratelimit::AUTH).map_err(AppError::rate_limited)?;
     let invite = req.invite_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    match st.cfg.registration {
+    match registration_mode(&st).await? {
         RegistrationMode::Closed => {
             return Err(AppError::BadRequest("registration_closed", "регистрация на этом сервере закрыта".into()));
         }
@@ -58,20 +98,12 @@ pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req
     }
     let username = req.username.trim().to_owned();
     validate_username(&username)?;
-    if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&req.password.chars().count()) {
-        return Err(AppError::BadRequest("bad_password", format!("пароль: от {MIN_PASSWORD} символов")));
-    }
-    // Argon2 намеренно медленный — не блокируем им рантайм
-    let password = req.password;
-    let hash = tokio::task::spawn_blocking(move || {
-        Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string())
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .map_err(|e| AppError::Internal(format!("argon2: {e}")))?;
+    validate_password(&req.password)?;
+    let hash = hash_password(req.password).await?;
 
     let id = st.ids.next();
-    let res = sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)")
+    // Первый аккаунт на сервере — его администратор
+    let res = sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, NOT EXISTS (SELECT 1 FROM users))")
         .bind(id.0 as i64)
         .bind(&username)
         .bind(&hash)
@@ -81,7 +113,7 @@ pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req
         Err(e) if is_unique_violation(&e) => Err(AppError::Conflict("username_taken", "это имя уже занято".into())),
         Err(e) => Err(e.into()),
         Ok(_) => {
-            let user = User { id, username, display_name: None };
+            let user = User { id, username, display_name: None, avatar: None };
             // С кодом приглашения — сразу в сообщество. Не вышло (код истёк в эту секунду) —
             // аккаунт всё равно создан, вступить можно позже
             if let Some(code) = invite
@@ -95,14 +127,15 @@ pub async fn register(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req
 }
 
 /// Сведения для экрана входа: какой режим регистрации
-pub async fn instance(State(st): State<Shared>) -> Json<InstanceInfo> {
-    Json(InstanceInfo { registration: st.cfg.registration })
+pub async fn instance(State(st): State<Shared>) -> ApiResult<Json<InstanceInfo>> {
+    Ok(Json(InstanceInfo { registration: registration_mode(&st).await? }))
 }
 
 pub async fn login(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): Json<LoginRequest>) -> ApiResult<Json<LoginResponse>> {
     st.limiter.check(&format!("auth:{ip}"), ratelimit::AUTH).map_err(AppError::rate_limited)?;
-    let row: Option<(i64, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, username, display_name, password_hash FROM users WHERE lower(username) = lower($1)",
+    let row: Option<(i64, String, Option<String>, Option<i64>, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT id, username, display_name, avatar_id, password_hash, totp_enabled, totp_secret
+           FROM users WHERE lower(username) = lower($1) AND NOT deleted",
     )
     .bind(req.username.trim())
     .fetch_optional(&st.db)
@@ -110,15 +143,20 @@ pub async fn login(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): 
 
     // Одинаковый ответ для «нет пользователя» и «неверный пароль»: не подсказываем, какие имена есть
     let bad = || AppError::BadRequest("bad_credentials", "неверное имя или пароль".into());
-    let Some((id, username, display_name, hash)) = row else { return Err(bad()) };
-    let password = req.password;
-    let valid = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&hash).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
-    })
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    if !valid {
+    let Some((id, username, display_name, avatar, hash, totp_enabled, totp_secret)) = row else { return Err(bad()) };
+    if !verify_password(req.password, hash).await? {
         return Err(bad());
+    }
+    // Пароль верный — теперь второй фактор (код спрашиваем только после пароля)
+    if totp_enabled {
+        let secret = totp_secret.unwrap_or_default();
+        match req.totp.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            None => return Err(AppError::BadRequest("totp_required", "введите код из приложения-аутентификатора".into())),
+            Some(code) if !crate::totp::check(&secret, code) => {
+                return Err(AppError::BadRequest("bad_totp", "неверный код подтверждения".into()));
+            }
+            Some(_) => {}
+        }
     }
 
     let token = new_token();
@@ -133,7 +171,7 @@ pub async fn login(State(st): State<Shared>, ClientIp(ip): ClientIp, Json(req): 
     .execute(&st.db)
     .await?;
 
-    Ok(Json(LoginResponse { token, user: user_from_row((id, username, display_name)) }))
+    Ok(Json(LoginResponse { token, user: user_from_row((id, username, display_name, avatar)) }))
 }
 
 pub async fn logout(State(st): State<Shared>, headers: HeaderMap) -> ApiResult<StatusCode> {
@@ -152,18 +190,18 @@ fn new_token() -> String {
     URL_SAFE_NO_PAD.encode(buf)
 }
 
-fn token_hash(token: &str) -> Vec<u8> {
+pub fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
 /// Пользователь по токену сессии (REST и шлюз)
 pub async fn user_by_token(db: &PgPool, token: &str) -> ApiResult<Option<User>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name FROM sessions s JOIN users u ON u.id = s.user_id
+        "SELECT u.id, u.username, u.display_name, u.avatar_id FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token_hash = $1 AND s.expires_at > now()",
     )
     .bind(token_hash(token))

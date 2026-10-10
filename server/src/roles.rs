@@ -8,7 +8,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use feather_protocol::{Event, GuildMember, Role, RoleRequest, Snowflake, perms};
+use feather_protocol::{Ban, Channel, ChannelKind, Event, GuildMember, Overwrite, OverwriteKind, OverwriteRequest, Role, RoleRequest, Snowflake, perms};
 use sqlx::PgPool;
 
 use crate::Shared;
@@ -65,6 +65,165 @@ pub async fn member_perms(db: &PgPool, guild: Snowflake, user: Snowflake) -> Api
         top: if owner { i32::MAX } else { top },
         owner,
     })
+}
+
+/// Права в конкретном канале: права на сервере с учётом настроек канала.
+/// У ветки — настройки родительского канала
+pub async fn channel_perms(db: &PgPool, channel: &Channel, user: Snowflake) -> ApiResult<Perms> {
+    let mut p = member_perms(db, channel.guild_id, user).await?;
+    if p.owner || p.bits & perms::ADMINISTRATOR != 0 {
+        return Ok(p);
+    }
+    let source = if channel.kind == ChannelKind::Thread { channel.parent_id.unwrap_or(channel.id) } else { channel.id };
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT o.target_id, o.kind, o.allow, o.deny FROM channel_overwrites o
+          WHERE o.channel_id = $1 AND (
+                o.target_id = $2 OR o.target_id = $3
+             OR (o.kind = 'role' AND o.target_id IN (SELECT role_id FROM member_roles WHERE guild_id = $3 AND user_id = $2)))",
+    )
+    .bind(source.0 as i64)
+    .bind(user.0 as i64)
+    .bind(channel.guild_id.0 as i64)
+    .fetch_all(db)
+    .await?;
+    if rows.is_empty() {
+        return Ok(p);
+    }
+    let guild = channel.guild_id.0 as i64;
+    let mut everyone = None;
+    let mut member = None;
+    let mut roles = (0u64, 0u64);
+    for (target, kind, allow, deny) in rows {
+        let pair = (allow as u64, deny as u64);
+        match kind.as_str() {
+            "member" if target == user.0 as i64 => member = Some(pair),
+            "role" if target == guild => everyone = Some(pair),
+            "role" => {
+                roles.0 |= pair.0;
+                roles.1 |= pair.1;
+            }
+            _ => {}
+        }
+    }
+    p.bits = perms::apply_overwrites(p.bits, everyone, roles, member);
+    Ok(p)
+}
+
+/// Права всех каналов сервера на сервере, разом — для списка каналов и непрочитанного.
+/// Возвращает id каналов, которые пользователь видит
+pub async fn visible_channels(db: &PgPool, guild: Snowflake, user: Snowflake, channels: &[Channel]) -> ApiResult<Vec<Snowflake>> {
+    let base = member_perms(db, guild, user).await?;
+    if base.owner || base.bits & perms::ADMINISTRATOR != 0 {
+        return Ok(channels.iter().map(|c| c.id).collect());
+    }
+    let my_roles: Vec<(i64,)> = sqlx::query_as("SELECT role_id FROM member_roles WHERE guild_id = $1 AND user_id = $2")
+        .bind(guild.0 as i64)
+        .bind(user.0 as i64)
+        .fetch_all(db)
+        .await?;
+    let my_roles: std::collections::HashSet<u64> = my_roles.into_iter().map(|(r,)| r as u64).collect();
+    let mut out = Vec::new();
+    for c in channels {
+        let source = if c.kind == ChannelKind::Thread {
+            channels.iter().find(|p| Some(p.id) == c.parent_id).unwrap_or(c)
+        } else {
+            c
+        };
+        let (mut everyone, mut member, mut roles) = (None, None, (0u64, 0u64));
+        for o in &source.overwrites {
+            match o.kind {
+                OverwriteKind::Member if o.id == user => member = Some((o.allow, o.deny)),
+                OverwriteKind::Role if o.id == guild => everyone = Some((o.allow, o.deny)),
+                OverwriteKind::Role if my_roles.contains(&o.id.0) => {
+                    roles.0 |= o.allow;
+                    roles.1 |= o.deny;
+                }
+                _ => {}
+            }
+        }
+        if perms::apply_overwrites(base.bits, everyone, roles, member) & perms::VIEW_CHANNEL != 0 {
+            out.push(c.id);
+        }
+    }
+    Ok(out)
+}
+
+/// Настройки прав канала (для выдачи вместе с каналом)
+pub async fn load_overwrites(db: &PgPool, channel_ids: &[i64]) -> ApiResult<std::collections::HashMap<i64, Vec<Overwrite>>> {
+    let rows: Vec<(i64, i64, String, i64, i64)> =
+        sqlx::query_as("SELECT channel_id, target_id, kind, allow, deny FROM channel_overwrites WHERE channel_id = ANY($1) ORDER BY target_id")
+            .bind(channel_ids)
+            .fetch_all(db)
+            .await?;
+    let mut map: std::collections::HashMap<i64, Vec<Overwrite>> = Default::default();
+    for (c, t, kind, allow, deny) in rows {
+        map.entry(c).or_default().push(Overwrite {
+            id: Snowflake(t as u64),
+            kind: if kind == "member" { OverwriteKind::Member } else { OverwriteKind::Role },
+            allow: allow as u64,
+            deny: deny as u64,
+        });
+    }
+    Ok(map)
+}
+
+pub async fn put_overwrite(
+    State(st): State<Shared>,
+    user: AuthUser,
+    Path((channel_id, target)): Path<(Snowflake, Snowflake)>,
+    Json(req): Json<OverwriteRequest>,
+) -> ApiResult<Json<Channel>> {
+    let (channel, _) = crate::guilds::channel_for_member(&st.db, channel_id, user.id()).await?;
+    if matches!(channel.kind, ChannelKind::Dm | ChannelKind::Thread) {
+        return Err(AppError::BadRequest("bad_channel", "права задаются для каналов и категорий".into()));
+    }
+    let me = member_perms(&st.db, channel.guild_id, user.id()).await?.require(perms::MANAGE_CHANNELS | perms::MANAGE_ROLES)?;
+    if (req.allow | req.deny) & !perms::CHANNEL_SCOPED != 0 {
+        return Err(AppError::BadRequest("bad_perms", "в канале настраиваются только права канала".into()));
+    }
+    check_grant(&me, req.allow)?;
+    match req.kind {
+        OverwriteKind::Role => {
+            let role = load_role(&st.db, channel.guild_id, target).await?;
+            if role.id != channel.guild_id && !me.outranks(role.position) {
+                return Err(AppError::Forbidden);
+            }
+        }
+        OverwriteKind::Member => {
+            member_top(&st.db, channel.guild_id, target).await?;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO channel_overwrites (channel_id, target_id, kind, allow, deny) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (channel_id, target_id) DO UPDATE SET kind = EXCLUDED.kind, allow = EXCLUDED.allow, deny = EXCLUDED.deny",
+    )
+    .bind(channel_id.0 as i64)
+    .bind(target.0 as i64)
+    .bind(if req.kind == OverwriteKind::Member { "member" } else { "role" })
+    .bind(req.allow as i64)
+    .bind((req.deny & !req.allow) as i64)
+    .execute(&st.db)
+    .await?;
+    crate::audit::log(&st, channel.guild_id, user.id(), "overwrite_update", Some(channel_id), format!("#{}", channel.name)).await;
+    overwrites_changed(&st, channel_id, channel.guild_id).await
+}
+
+pub async fn delete_overwrite(State(st): State<Shared>, user: AuthUser, Path((channel_id, target)): Path<(Snowflake, Snowflake)>) -> ApiResult<Json<Channel>> {
+    let (channel, _) = crate::guilds::channel_for_member(&st.db, channel_id, user.id()).await?;
+    member_perms(&st.db, channel.guild_id, user.id()).await?.require(perms::MANAGE_CHANNELS | perms::MANAGE_ROLES)?;
+    sqlx::query("DELETE FROM channel_overwrites WHERE channel_id = $1 AND target_id = $2")
+        .bind(channel_id.0 as i64)
+        .bind(target.0 as i64)
+        .execute(&st.db)
+        .await?;
+    crate::audit::log(&st, channel.guild_id, user.id(), "overwrite_delete", Some(channel_id), format!("#{}", channel.name)).await;
+    overwrites_changed(&st, channel_id, channel.guild_id).await
+}
+
+async fn overwrites_changed(st: &Shared, channel_id: Snowflake, guild: Snowflake) -> ApiResult<Json<Channel>> {
+    let channel = crate::guilds::load_channel(&st.db, channel_id).await?;
+    st.bus.publish(Target::Guild(guild), Event::ChannelsInvalidated { guild_id: guild });
+    Ok(Json(channel))
 }
 
 type RoleRow = (i64, i64, String, i32, i64, i32);
@@ -163,6 +322,7 @@ pub async fn create_role(
         .execute(&st.db)
         .await?;
     st.bus.publish(Target::Guild(guild), Event::RoleCreate(role.clone()));
+    crate::audit::log(&st, guild, user.id(), "role_create", Some(role.id), &role.name).await;
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -205,6 +365,8 @@ pub async fn update_role(
         .execute(&st.db)
         .await?;
     st.bus.publish(Target::Guild(guild), Event::RoleUpdate(role.clone()));
+    st.bus.publish(Target::Guild(guild), Event::ChannelsInvalidated { guild_id: guild });
+    crate::audit::log(&st, guild, user.id(), "role_update", Some(role.id), &role.name).await;
     Ok(Json(role))
 }
 
@@ -218,7 +380,10 @@ pub async fn delete_role(State(st): State<Shared>, user: AuthUser, Path((guild, 
         return Err(AppError::Forbidden);
     }
     sqlx::query("DELETE FROM roles WHERE id = $1").bind(role.id.0 as i64).execute(&st.db).await?;
+    sqlx::query("DELETE FROM channel_overwrites WHERE target_id = $1").bind(role.id.0 as i64).execute(&st.db).await?;
     st.bus.publish(Target::Guild(guild), Event::RoleDelete { guild_id: guild, role_id: role.id });
+    st.bus.publish(Target::Guild(guild), Event::ChannelsInvalidated { guild_id: guild });
+    crate::audit::log(&st, guild, user.id(), "role_delete", Some(role.id), &role.name).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -247,6 +412,8 @@ async fn set_member_role(st: &Shared, actor: Snowflake, guild: Snowflake, target
     sqlx::query(q).bind(guild.0 as i64).bind(target.0 as i64).bind(role_id.0 as i64).execute(&st.db).await?;
     let roles = member_roles(&st.db, guild, target).await?;
     st.bus.publish(Target::Guild(guild), Event::GuildMemberUpdate { guild_id: guild, user_id: target, roles });
+    st.bus.publish(Target::User(target), Event::ChannelsInvalidated { guild_id: guild });
+    crate::audit::log(st, guild, actor, if add { "member_role_add" } else { "member_role_remove" }, Some(target), &role.name).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -268,8 +435,8 @@ pub async fn remove_member_role(
 
 pub async fn list_members(State(st): State<Shared>, user: AuthUser, Path(guild): Path<Snowflake>) -> ApiResult<Json<Vec<GuildMember>>> {
     member_perms(&st.db, guild, user.id()).await?;
-    let rows: Vec<(i64, String, Option<String>, Vec<i64>)> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name,
+    let rows: Vec<(i64, String, Option<String>, Option<i64>, Vec<i64>)> = sqlx::query_as(
+        "SELECT u.id, u.username, u.display_name, u.avatar_id,
                 COALESCE(array_agg(mr.role_id ORDER BY mr.role_id) FILTER (WHERE mr.role_id IS NOT NULL), '{}')
            FROM guild_members m JOIN users u ON u.id = m.user_id
            LEFT JOIN member_roles mr ON mr.guild_id = m.guild_id AND mr.user_id = m.user_id
@@ -281,8 +448,8 @@ pub async fn list_members(State(st): State<Shared>, user: AuthUser, Path(guild):
     .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|(id, username, dn, roles)| GuildMember {
-                user: user_from_row((id, username, dn)),
+            .map(|(id, username, dn, avatar, roles)| GuildMember {
+                user: user_from_row((id, username, dn, avatar)),
                 roles: roles.into_iter().map(|r| Snowflake(r as u64)).collect(),
             })
             .collect(),
@@ -290,7 +457,7 @@ pub async fn list_members(State(st): State<Shared>, user: AuthUser, Path(guild):
 }
 
 /// Убрать участника с сервера и разослать события (кик, бан, выход)
-async fn remove_member(st: &Shared, guild: Snowflake, target: Snowflake) -> ApiResult<()> {
+pub async fn remove_member(st: &Shared, guild: Snowflake, target: Snowflake) -> ApiResult<()> {
     sqlx::query("DELETE FROM guild_members WHERE guild_id = $1 AND user_id = $2")
         .bind(guild.0 as i64)
         .bind(target.0 as i64)
@@ -319,6 +486,10 @@ pub async fn kick(State(st): State<Shared>, user: AuthUser, Path((guild, target)
         }
     }
     remove_member(&st, guild, target).await?;
+    if target != user.id() {
+        let name = crate::auth::load_user(&st.db, target).await.map(|u| u.username).unwrap_or_default();
+        crate::audit::log(&st, guild, user.id(), "kick", Some(target), name).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -340,13 +511,36 @@ pub async fn ban(State(st): State<Shared>, user: AuthUser, Path((guild, target))
         .bind(user.id().0 as i64)
         .execute(&st.db)
         .await?;
+    let name = crate::auth::load_user(&st.db, target).await.map(|u| u.username).unwrap_or_default();
+    crate::audit::log(&st, guild, user.id(), "ban", Some(target), name).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn unban(State(st): State<Shared>, user: AuthUser, Path((guild, target)): Path<(Snowflake, Snowflake)>) -> ApiResult<StatusCode> {
     member_perms(&st.db, guild, user.id()).await?.require(perms::BAN_MEMBERS)?;
-    sqlx::query("DELETE FROM bans WHERE guild_id = $1 AND user_id = $2").bind(guild.0 as i64).bind(target.0 as i64).execute(&st.db).await?;
+    let removed = sqlx::query("DELETE FROM bans WHERE guild_id = $1 AND user_id = $2")
+        .bind(guild.0 as i64)
+        .bind(target.0 as i64)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    if removed > 0 {
+        let name = crate::auth::load_user(&st.db, target).await.map(|u| u.username).unwrap_or_default();
+        crate::audit::log(&st, guild, user.id(), "unban", Some(target), name).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_bans(State(st): State<Shared>, user: AuthUser, Path(guild): Path<Snowflake>) -> ApiResult<Json<Vec<Ban>>> {
+    member_perms(&st.db, guild, user.id()).await?.require(perms::BAN_MEMBERS)?;
+    let rows: Vec<crate::auth::UserRow> = sqlx::query_as(
+        "SELECT u.id, u.username, u.display_name, u.avatar_id FROM bans b JOIN users u ON u.id = b.user_id
+          WHERE b.guild_id = $1 ORDER BY b.created_at DESC",
+    )
+    .bind(guild.0 as i64)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(rows.into_iter().map(|r| Ban { user: user_from_row(r) }).collect()))
 }
 
 pub async fn is_banned(db: &PgPool, guild: i64, user: Snowflake) -> ApiResult<bool> {

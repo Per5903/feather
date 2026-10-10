@@ -14,7 +14,7 @@ use crate::error::{ApiResult, AppError};
 /// Личный канал глазами пользователя `viewer`: собеседники без него самого
 async fn dm_for(db: &PgPool, channel: i64, viewer: Snowflake) -> ApiResult<DmChannel> {
     let users: Vec<UserRow> = sqlx::query_as(
-        "SELECT u.id, u.username, u.display_name FROM channel_recipients r JOIN users u ON u.id = r.user_id
+        "SELECT u.id, u.username, u.display_name, u.avatar_id FROM channel_recipients r JOIN users u ON u.id = r.user_id
           WHERE r.channel_id = $1 AND r.user_id <> $2",
     )
     .bind(channel)

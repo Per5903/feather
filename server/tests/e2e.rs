@@ -97,7 +97,7 @@ impl TestServer {
         let (st, _) = self.post::<_, User>("/auth/register", None, &creds).await;
         assert_eq!(st, StatusCode::CREATED, "регистрация {name}");
         let (st, login) = self
-            .post("/auth/login", None, &LoginRequest { username: name.into(), password: creds.password, device_name: None })
+            .post("/auth/login", None, &LoginRequest { username: name.into(), password: creds.password, device_name: None, totp: None })
             .await;
         assert_eq!(st, StatusCode::OK);
         login.unwrap()
@@ -160,7 +160,7 @@ async fn full_flow() {
     assert_eq!(err.unwrap().code, "username_taken");
     let weak = RegisterRequest { username: "carol".into(), password: "short".into(), invite_code: None };
     assert_eq!(srv.post::<_, ApiError>("/auth/register", None, &weak).await.0, StatusCode::BAD_REQUEST);
-    let wrong = LoginRequest { username: "alice".into(), password: "nope-nope".into(), device_name: None };
+    let wrong = LoginRequest { username: "alice".into(), password: "nope-nope".into(), device_name: None, totp: None };
     assert_eq!(srv.post::<_, ApiError>("/auth/login", None, &wrong).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(srv.get::<User>("/users/@me", "garbage").await.0, StatusCode::UNAUTHORIZED);
     let (_, me) = srv.get::<User>("/users/@me", &alice.token).await;
@@ -440,7 +440,7 @@ async fn rate_limits() {
 
     // Перебор паролей: не раньше 10-й попытки с одного IP — 429 и Retry-After.
     // Не завязываемся на скорость машины: на медленном CI ведро успевает чуть пополниться
-    let wrong = LoginRequest { username: "alice".into(), password: "guess-guess".into(), device_name: None };
+    let wrong = LoginRequest { username: "alice".into(), password: "guess-guess".into(), device_name: None, totp: None };
     let mut failed_logins = 0;
     let limited = loop {
         let resp = srv.http.post(srv.url("/auth/login")).json(&wrong).send().await.unwrap();
@@ -650,7 +650,7 @@ async fn roles_and_moderation() {
 
     // Без SEND_MESSAGES у @everyone писать нельзя (403), а модератору с ролью — тоже нельзя:
     // у роли «Модератор» этого права нет, а @everyone его больше не даёт
-    let everyone = RoleRequest { permissions: Some(CREATE_INVITE | VOICE_CONNECT), ..Default::default() };
+    let everyone = RoleRequest { permissions: Some(VIEW_CHANNEL | CREATE_INVITE | VOICE_CONNECT), ..Default::default() };
     srv.req::<_, Role>(reqwest::Method::PATCH, &format!("/guilds/{gid}/roles/{gid}"), Some(&alice.token), Some(&everyone)).await;
     let msg = SendMessageRequest { content: "можно?".into(), reply_to_id: None, nonce: None, attachment_ids: vec![] };
     assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages"), Some(&bob.token), &msg).await.0, StatusCode::FORBIDDEN);
@@ -759,7 +759,7 @@ async fn registration_modes() {
     let (_, inv) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&owner.token), &CreateInviteRequest::default()).await;
     let code = inv.unwrap().code;
     assert_eq!(srv.post::<_, User>("/auth/register", None, &reg("новичок", Some(format!(" {code} ")))).await.0, StatusCode::CREATED);
-    let (_, login) = srv.post::<_, LoginResponse>("/auth/login", None, &LoginRequest { username: "новичок".into(), password: "correct horse battery".into(), device_name: None }).await;
+    let (_, login) = srv.post::<_, LoginResponse>("/auth/login", None, &LoginRequest { username: "новичок".into(), password: "correct horse battery".into(), device_name: None, totp: None }).await;
     let (_, guilds) = srv.get::<Vec<Guild>>("/users/@me/guilds", &login.unwrap().token).await;
     assert_eq!(guilds.unwrap().iter().map(|g| g.id).collect::<Vec<_>>(), vec![gid], "с кодом — сразу в сообществе");
     srv.drop_db().await;
@@ -768,5 +768,281 @@ async fn registration_modes() {
     let srv = TestServer::start_with(|c| c.registration = RegistrationMode::Closed).await;
     let (st, err) = srv.post::<_, ApiError>("/auth/register", None, &reg("кто-то", None)).await;
     assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "registration_closed"));
+    srv.drop_db().await;
+}
+
+/// Текущий код TOTP — как его считает приложение-аутентификатор
+fn totp_now(secret: &str) -> String {
+    use hmac::{Hmac, Mac};
+    const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut key, mut buf, mut bits) = (Vec::new(), 0u32, 0);
+    for c in secret.chars() {
+        buf = (buf << 5) | B32.iter().position(|&b| b as char == c).unwrap() as u32;
+        bits += 5;
+        if bits >= 8 {
+            key.push((buf >> (bits - 8)) as u8);
+            bits -= 8;
+        }
+    }
+    let counter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 30;
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).unwrap();
+    mac.update(&counter.to_be_bytes());
+    let h = mac.finalize().into_bytes();
+    let off = (h[19] & 0x0f) as usize;
+    let bin = u32::from_be_bytes([h[off] & 0x7f, h[off + 1], h[off + 2], h[off + 3]]);
+    format!("{:06}", bin % 1_000_000)
+}
+
+#[tokio::test]
+async fn account_settings_and_2fa() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, created) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "Клан".into() }).await;
+    let gid = created.unwrap().guild.id;
+    let (_, invite) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", invite.unwrap().code), Some(&bob.token), &()).await;
+    let (mut gw_bob, _) = GatewayClient::connect(srv.addr, &bob.token).await;
+
+    // Отображаемое имя: участники сообщества получают USER_UPDATE
+    let (st, me) = srv.req::<_, User>(reqwest::Method::PATCH, "/users/@me", Some(&alice.token), Some(&UpdateMeRequest { display_name: Some("Алиса".into()) })).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(me.unwrap().shown_name(), "Алиса");
+    match gw_bob.next_event().await {
+        Event::UserUpdate(u) => assert_eq!(u.display_name.as_deref(), Some("Алиса")),
+        other => panic!("ожидался USER_UPDATE, пришло {other:?}"),
+    }
+
+    // Аватар: картинка ужимается до 128×128, адрес меняется с версией
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(300, 200, image::Rgb([200, 30, 30])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let resp = srv.http.put(srv.url("/users/@me/avatar")).bearer_auth(&alice.token).body(png).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me: User = resp.json().await.unwrap();
+    let version = me.avatar.expect("версия аватара");
+    let resp = srv.http.get(srv.url(&format!("/avatars/{}/{version}", me.id))).bearer_auth(&bob.token).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let img = image::load_from_memory(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!((img.width(), img.height()), (128, 128));
+    let bad = srv.http.put(srv.url("/users/@me/avatar")).bearer_auth(&alice.token).body("не картинка").send().await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    // Смена пароля: нужен текущий; другие сеансы выходят
+    let second = srv.post::<_, LoginResponse>("/auth/login", None, &LoginRequest { username: "alice".into(), password: "correct horse battery".into(), ..Default::default() }).await.1.unwrap();
+    let wrong = ChangePasswordRequest { current: "не тот".into(), new: "new password 123".into() };
+    assert_eq!(srv.post::<_, ApiError>("/users/@me/password", Some(&alice.token), &wrong).await.0, StatusCode::BAD_REQUEST);
+    let ok = ChangePasswordRequest { current: "correct horse battery".into(), new: "new password 123".into() };
+    assert_eq!(srv.post::<_, ()>("/users/@me/password", Some(&alice.token), &ok).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(srv.get::<User>("/users/@me", &second.token).await.0, StatusCode::UNAUTHORIZED, "другой сеанс вышел");
+    assert_eq!(srv.get::<User>("/users/@me", &alice.token).await.0, StatusCode::OK, "текущий остался");
+
+    // 2FA: настройка → включение кодом → вход требует код
+    let (_, setup) = srv.post::<_, TotpSetup>("/users/@me/2fa/setup", Some(&alice.token), &()).await;
+    let setup = setup.unwrap();
+    assert!(setup.uri.starts_with("otpauth://totp/Feather:alice?secret="));
+    assert_eq!(srv.post::<_, ApiError>("/users/@me/2fa/enable", Some(&alice.token), &TotpCode { code: "000000".into() }).await.0, StatusCode::BAD_REQUEST);
+    let code = totp_now(&setup.secret);
+    assert_eq!(srv.post::<_, ()>("/users/@me/2fa/enable", Some(&alice.token), &TotpCode { code }).await.0, StatusCode::NO_CONTENT);
+    let login = LoginRequest { username: "alice".into(), password: "new password 123".into(), ..Default::default() };
+    let (st, err) = srv.post::<_, ApiError>("/auth/login", None, &login).await;
+    assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "totp_required"));
+    let login = LoginRequest { totp: Some(totp_now(&setup.secret)), ..login };
+    assert_eq!(srv.post::<_, LoginResponse>("/auth/login", None, &login).await.0, StatusCode::OK);
+
+    // Удаление аккаунта: владельцу сообщества сначала надо его передать
+    let confirm = ConfirmRequest { password: "new password 123".into(), totp: Some(totp_now(&setup.secret)) };
+    let (st, err) = srv.req::<_, ApiError>(reqwest::Method::DELETE, "/users/@me", Some(&alice.token), Some(&confirm)).await;
+    assert_eq!((st, err.unwrap().code.as_str()), (StatusCode::BAD_REQUEST, "owns_guilds"));
+    let transfer = UpdateGuildRequest { owner_id: Some(bob.user.id), ..Default::default() };
+    let (st, g) = srv.req::<_, Guild>(reqwest::Method::PATCH, &format!("/guilds/{gid}"), Some(&alice.token), Some(&transfer)).await;
+    assert_eq!((st, g.unwrap().owner_id), (StatusCode::OK, bob.user.id));
+    // Пароль проверяется заново — повторим запрос (лимит попыток подтверждения не превышен)
+    let (st, _) = srv.req::<_, ()>(reqwest::Method::DELETE, "/users/@me", Some(&alice.token), Some(&confirm)).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(srv.get::<User>("/users/@me", &alice.token).await.0, StatusCode::UNAUTHORIZED);
+    let (_, members) = srv.get::<Vec<GuildMember>>(&format!("/guilds/{gid}/members"), &bob.token).await;
+    assert_eq!(members.unwrap().len(), 1, "удалённый ушёл из сообщества");
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_channels_and_audit() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, created) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "Клан".into() }).await;
+    let created = created.unwrap();
+    let gid = created.guild.id;
+    let general = created.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, invite) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", invite.unwrap().code), Some(&bob.token), &()).await;
+
+    // Закрытый канал: @everyone не видит, роль «Офицер» — видит
+    let req = CreateChannelRequest { name: "штаб".into(), kind: ChannelKind::Text, parent_id: None };
+    let (_, secret) = srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&alice.token), &req).await;
+    let secret = secret.unwrap().id;
+    let hide = OverwriteRequest { kind: OverwriteKind::Role, allow: 0, deny: perms::VIEW_CHANNEL };
+    let (st, ch) = srv.req::<_, Channel>(reqwest::Method::PUT, &format!("/channels/{secret}/overwrites/{gid}"), Some(&alice.token), Some(&hide)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ch.unwrap().overwrites.len(), 1);
+    let (mut gw_bob, _) = GatewayClient::connect(srv.addr, &bob.token).await;
+    gw_bob.send(&ClientOp::SubscribeGuild { guild_id: gid }).await;
+
+    let (_, chans) = srv.get::<Vec<Channel>>(&format!("/guilds/{gid}/channels"), &bob.token).await;
+    assert!(!chans.unwrap().iter().any(|c| c.id == secret), "боб не видит закрытый канал");
+    assert_eq!(srv.get::<Vec<Message>>(&format!("/channels/{secret}/messages"), &bob.token).await.0, StatusCode::NOT_FOUND);
+    // Сообщение в закрытый канал не приходит бобу через шлюз, а в общий — приходит
+    let msg = |t: &str| SendMessageRequest { content: t.into(), ..Default::default() };
+    srv.post::<_, Message>(&format!("/channels/{secret}/messages"), Some(&alice.token), &msg("секрет")).await;
+    srv.post::<_, Message>(&format!("/channels/{general}/messages"), Some(&alice.token), &msg("всем привет")).await;
+    loop {
+        match gw_bob.next_event().await {
+            Event::MessageCreate(m) => {
+                assert_eq!(m.content, "всем привет", "сообщение закрытого канала просочилось");
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let (_, officer) = srv.post::<_, Role>(&format!("/guilds/{gid}/roles"), Some(&alice.token), &RoleRequest { name: Some("Офицер".into()), ..Default::default() }).await;
+    let officer = officer.unwrap().id;
+    let allow = OverwriteRequest { kind: OverwriteKind::Role, allow: perms::VIEW_CHANNEL, deny: 0 };
+    srv.req::<_, Channel>(reqwest::Method::PUT, &format!("/channels/{secret}/overwrites/{officer}"), Some(&alice.token), Some(&allow)).await;
+    srv.req::<(), ()>(reqwest::Method::PUT, &format!("/guilds/{gid}/members/{}/roles/{officer}", bob.user.id), Some(&alice.token), None).await;
+    let (_, chans) = srv.get::<Vec<Channel>>(&format!("/guilds/{gid}/channels"), &bob.token).await;
+    assert!(chans.unwrap().iter().any(|c| c.id == secret), "с ролью видно");
+    // В канале можно только то, что относится к каналу
+    let bad = OverwriteRequest { kind: OverwriteKind::Role, allow: perms::BAN_MEMBERS, deny: 0 };
+    assert_eq!(srv.req::<_, ApiError>(reqwest::Method::PUT, &format!("/channels/{secret}/overwrites/{gid}"), Some(&alice.token), Some(&bad)).await.0, StatusCode::BAD_REQUEST);
+
+    // Переименование и удаление канала и сообщества
+    let rename = UpdateChannelRequest { name: Some("совет".into()), ..Default::default() };
+    let (st, ch) = srv.req::<_, Channel>(reqwest::Method::PATCH, &format!("/channels/{secret}"), Some(&alice.token), Some(&rename)).await;
+    assert_eq!((st, ch.unwrap().name.as_str()), (StatusCode::OK, "совет"));
+    assert_eq!(srv.req::<_, ApiError>(reqwest::Method::PATCH, &format!("/channels/{secret}"), Some(&bob.token), Some(&rename)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/channels/{secret}"), Some(&alice.token), None).await.0, StatusCode::NO_CONTENT);
+    let (st, g) = srv.req::<_, Guild>(reqwest::Method::PATCH, &format!("/guilds/{gid}"), Some(&alice.token), Some(&UpdateGuildRequest { name: Some("Новый клан".into()), ..Default::default() })).await;
+    assert_eq!((st, g.unwrap().name.as_str()), (StatusCode::OK, "Новый клан"));
+
+    // Бан и список банов, разбан
+    srv.req::<(), ()>(reqwest::Method::PUT, &format!("/guilds/{gid}/bans/{}", bob.user.id), Some(&alice.token), None).await;
+    let (_, bans) = srv.get::<Vec<Ban>>(&format!("/guilds/{gid}/bans"), &alice.token).await;
+    assert_eq!(bans.unwrap()[0].user.id, bob.user.id);
+    srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/guilds/{gid}/bans/{}", bob.user.id), Some(&alice.token), None).await;
+    assert!(srv.get::<Vec<Ban>>(&format!("/guilds/{gid}/bans"), &alice.token).await.1.unwrap().is_empty());
+
+    // Журнал модерации: всё записано, новые сверху
+    let (_, log) = srv.get::<Vec<AuditEntry>>(&format!("/guilds/{gid}/audit-log"), &alice.token).await;
+    let actions: Vec<String> = log.unwrap().into_iter().map(|e| e.action).collect();
+    for a in ["unban", "ban", "guild_update", "channel_delete", "channel_update", "member_role_add", "overwrite_update", "role_create", "channel_create"] {
+        assert!(actions.contains(&a.to_owned()), "в журнале нет {a}: {actions:?}");
+    }
+    assert_eq!(actions[0], "unban");
+    assert_eq!(srv.get::<Vec<AuditEntry>>(&format!("/guilds/{gid}/audit-log"), &bob.token).await.0, StatusCode::NOT_FOUND, "боб уже не участник");
+
+    // Удаление сообщества: только владелец; участники получают GUILD_DELETE
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/guilds/{gid}"), Some(&alice.token), None).await.0, StatusCode::NO_CONTENT);
+    assert!(srv.get::<Vec<Guild>>("/users/@me/guilds", &alice.token).await.1.unwrap().is_empty());
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn reactions_pins_search_threads() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, created) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "Клан".into() }).await;
+    let created = created.unwrap();
+    let gid = created.guild.id;
+    let text = created.channels.iter().find(|c| c.kind == ChannelKind::Text).unwrap().id;
+    let (_, invite) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", invite.unwrap().code), Some(&bob.token), &()).await;
+    let (mut gw_alice, _) = GatewayClient::connect(srv.addr, &alice.token).await;
+    gw_alice.send(&ClientOp::SubscribeGuild { guild_id: gid }).await;
+
+    let send = |t: &str| SendMessageRequest { content: t.into(), ..Default::default() };
+    let m1 = srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&alice.token), &send("Собираемся в 21:00 на рейд")).await.1.unwrap();
+    srv.post::<_, Message>(&format!("/channels/{text}/messages"), Some(&bob.token), &send("ок, буду")).await;
+
+    // Реакции: событие, счётчик, «моя»
+    let fire = "%F0%9F%94%A5"; // 🔥 в адресе
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::PUT, &format!("/channels/{text}/messages/{}/reactions/{fire}", m1.id), Some(&bob.token), None).await.0, StatusCode::NO_CONTENT);
+    srv.req::<(), ()>(reqwest::Method::PUT, &format!("/channels/{text}/messages/{}/reactions/{fire}", m1.id), Some(&alice.token), None).await;
+    assert_eq!(srv.req::<(), ApiError>(reqwest::Method::PUT, &format!("/channels/{text}/messages/{}/reactions/abc", m1.id), Some(&alice.token), None).await.0, StatusCode::BAD_REQUEST);
+    loop {
+        if let Event::ReactionAdd { emoji, user_id, .. } = gw_alice.next_event().await {
+            assert_eq!((emoji.as_str(), user_id), ("🔥", bob.user.id));
+            break;
+        }
+    }
+    let history = srv.get::<Vec<Message>>(&format!("/channels/{text}/messages"), &bob.token).await.1.unwrap();
+    let r = &history.iter().find(|m| m.id == m1.id).unwrap().reactions;
+    assert_eq!((r[0].emoji.as_str(), r[0].count, r[0].me), ("🔥", 2, true));
+    srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/channels/{text}/messages/{}/reactions/{fire}", m1.id), Some(&bob.token), None).await;
+    let history = srv.get::<Vec<Message>>(&format!("/channels/{text}/messages"), &bob.token).await.1.unwrap();
+    let r = &history.iter().find(|m| m.id == m1.id).unwrap().reactions;
+    assert_eq!((r[0].count, r[0].me), (1, false));
+
+    // Закреп: только модератор
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::PUT, &format!("/channels/{text}/pins/{}", m1.id), Some(&bob.token), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::PUT, &format!("/channels/{text}/pins/{}", m1.id), Some(&alice.token), None).await.0, StatusCode::NO_CONTENT);
+    let pins = srv.get::<Vec<Message>>(&format!("/channels/{text}/pins"), &bob.token).await.1.unwrap();
+    assert!(pins.len() == 1 && pins[0].pinned);
+
+    // Поиск: регистр не важен, % в запросе — просто символ
+    let found = srv.get::<Vec<Message>>(&format!("/guilds/{gid}/search?q=РЕЙД"), &bob.token).await.1.unwrap();
+    assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m1.id]);
+    assert!(srv.get::<Vec<Message>>(&format!("/channels/{text}/search?q=%25%25"), &bob.token).await.1.unwrap().is_empty());
+    assert_eq!(srv.get::<ApiError>(&format!("/channels/{text}/search?q=a"), &bob.token).await.0, StatusCode::BAD_REQUEST);
+
+    // Ветка из сообщения: канал-ветка, сообщение помнит её; вторую ветку на то же сообщение — нельзя
+    let (st, thread) = srv.post::<_, Channel>(&format!("/channels/{text}/messages/{}/threads", m1.id), Some(&bob.token), &CreateThreadRequest { name: "Состав на рейд".into() }).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let thread = thread.unwrap();
+    assert_eq!((thread.kind, thread.parent_id), (ChannelKind::Thread, Some(text)));
+    assert_eq!(srv.post::<_, ApiError>(&format!("/channels/{text}/messages/{}/threads", m1.id), Some(&bob.token), &CreateThreadRequest { name: "ещё".into() }).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(srv.post::<_, Message>(&format!("/channels/{}/messages", thread.id), Some(&alice.token), &send("я танк")).await.0, StatusCode::CREATED);
+    let history = srv.get::<Vec<Message>>(&format!("/channels/{text}/messages"), &bob.token).await.1.unwrap();
+    assert_eq!(history.iter().find(|m| m.id == m1.id).unwrap().thread_id, Some(thread.id));
+    let (_, chans) = srv.get::<Vec<Channel>>(&format!("/guilds/{gid}/channels"), &bob.token).await;
+    assert!(chans.unwrap().iter().any(|c| c.id == thread.id));
+    srv.drop_db().await;
+}
+
+#[tokio::test]
+async fn admin_panel() {
+    let srv = TestServer::start().await;
+    let admin = srv.signup("admin").await;
+    let bob = srv.signup("bob").await;
+    let (_, ready) = GatewayClient::connect(srv.addr, &admin.token).await;
+    assert!(matches!(ready, ServerOp::Ready { admin: true, .. }), "первый — администратор");
+    let (_, ready) = GatewayClient::connect(srv.addr, &bob.token).await;
+    assert!(matches!(ready, ServerOp::Ready { admin: false, .. }));
+    assert_eq!(srv.get::<Vec<AdminUser>>("/admin/users", &bob.token).await.0, StatusCode::FORBIDDEN);
+    let users = srv.get::<Vec<AdminUser>>("/admin/users", &admin.token).await.1.unwrap();
+    assert_eq!(users.len(), 2);
+
+    // Режим регистрации из панели перекрывает переменную окружения
+    let closed = AdminSettings { registration: RegistrationMode::Closed };
+    assert_eq!(srv.req::<_, AdminSettings>(reqwest::Method::PUT, "/admin/settings", Some(&admin.token), Some(&closed)).await.0, StatusCode::OK);
+    let info: InstanceInfo = srv.http.get(srv.url("/instance")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(info.registration, RegistrationMode::Closed);
+    let creds = RegisterRequest { username: "carol".into(), password: "correct horse battery".into(), invite_code: None };
+    assert_eq!(srv.post::<_, ApiError>("/auth/register", None, &creds).await.0, StatusCode::BAD_REQUEST);
+
+    // Сброс пароля: старые сеансы выходят, временный пароль работает
+    let (_, temp) = srv.post::<_, TempPassword>(&format!("/admin/users/{}/password-reset", bob.user.id), Some(&admin.token), &()).await;
+    assert_eq!(srv.get::<User>("/users/@me", &bob.token).await.0, StatusCode::UNAUTHORIZED);
+    let login = LoginRequest { username: "bob".into(), password: temp.unwrap().password, ..Default::default() };
+    let (st, relogin) = srv.post::<_, LoginResponse>("/auth/login", None, &login).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Удаление пользователя вместе с его сообществом
+    let (_, g) = srv.post::<_, GuildWithChannels>("/guilds", Some(&relogin.unwrap().token), &CreateGuildRequest { name: "Боб".into() }).await;
+    let gid = g.unwrap().guild.id;
+    assert_eq!(srv.req::<(), ()>(reqwest::Method::DELETE, &format!("/admin/users/{}", bob.user.id), Some(&admin.token), None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(srv.get::<Vec<AdminUser>>("/admin/users", &admin.token).await.1.unwrap().len(), 1);
+    assert_eq!(srv.post::<_, ApiError>("/auth/login", None, &login).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(srv.get::<Guild>(&format!("/guilds/{gid}"), &admin.token).await.0, StatusCode::NOT_FOUND);
     srv.drop_db().await;
 }

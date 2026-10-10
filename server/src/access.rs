@@ -17,7 +17,7 @@ impl Access {
     /// В канал вообще пишут сообщения: текстовый канал сервера или личный
     pub fn is_textual(&self) -> bool {
         match self {
-            Access::Guild { channel, .. } => channel.kind == ChannelKind::Text,
+            Access::Guild { channel, .. } => matches!(channel.kind, ChannelKind::Text | ChannelKind::Thread),
             Access::Dm { .. } => true,
         }
     }
@@ -30,6 +30,13 @@ impl Access {
     /// Может удалять чужие сообщения: право MANAGE_MESSAGES. В личных — никто
     pub fn is_moderator(&self) -> bool {
         matches!(self, Access::Guild { perms, .. } if perms.has(perms::MANAGE_MESSAGES))
+    }
+
+    pub fn guild_id(&self) -> Option<Snowflake> {
+        match self {
+            Access::Guild { channel, .. } => Some(channel.guild_id),
+            Access::Dm { .. } => None,
+        }
     }
 
     /// Разослать событие тем, кто видит канал
@@ -64,10 +71,16 @@ pub async fn channel_access(db: &PgPool, channel_id: Snowflake, user: Snowflake)
     .await?;
     let (id, guild_id, kind, name, parent, position, owner) = row.ok_or(AppError::NotFound("канал"))?;
     match (guild_id, owner) {
-        (Some(g), Some(_)) => Ok(Access::Guild {
-            perms: crate::roles::member_perms(db, Snowflake(g as u64), user).await?,
-            channel: channel_from_row((id, g, kind, name, parent, position)),
-        }),
+        (Some(g), Some(_)) => {
+            let mut channel = channel_from_row((id, g, kind, name, parent, position));
+            channel.overwrites = crate::roles::load_overwrites(db, &[id]).await?.remove(&id).unwrap_or_default();
+            let perms = crate::roles::channel_perms(db, &channel, user).await?;
+            // Закрытый канал выглядит как несуществующий
+            if !perms.has(perms::VIEW_CHANNEL) {
+                return Err(AppError::NotFound("канал"));
+            }
+            Ok(Access::Guild { perms, channel })
+        }
         _ => {
             let recipients: Vec<(i64,)> = sqlx::query_as("SELECT user_id FROM channel_recipients WHERE channel_id = $1")
                 .bind(id)

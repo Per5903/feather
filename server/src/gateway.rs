@@ -4,7 +4,7 @@
 //! только по серверам, на которые клиент подписан (SUBSCRIBE_GUILD); по остальным —
 //! только UNREAD_UPDATE. Формат: MessagePack по умолчанию, `?encoding=json` для отладки.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -161,7 +161,10 @@ impl Session {
         let guild_ids: Vec<Snowflake> = guilds.iter().map(|g| g.id).collect();
         let voice_states = st.voice.for_guilds(&guild_ids);
         let me_user = user.clone();
-        s.send(&ServerOp::Ready { session_id: session_id.clone(), user, guilds, unread, voice_states }).await?;
+        let admin = crate::admin::is_admin(&st, me).await.unwrap_or(false);
+        s.send(&ServerOp::Ready { session_id: session_id.clone(), user, guilds, unread, voice_states, admin }).await?;
+        // Видимость каналов (закрытые каналы): кэш на соединение, сбрасывается при смене прав
+        let mut visible: HashMap<Snowflake, bool> = HashMap::new();
         tracing::debug!("шлюз: пользователь {me} подключён");
 
         // Клиент шлёт HEARTBEAT раз в интервал; два пропуска подряд — соединение мёртвое
@@ -203,8 +206,29 @@ impl Session {
                 },
                 env = bus.recv() => match env {
                     Ok(env) => {
+                        let (target, original) = env.as_ref();
+                        if matches!(
+                            original,
+                            Event::ChannelsInvalidated { .. } | Event::RoleUpdate(_) | Event::RoleDelete { .. } | Event::GuildMemberUpdate { .. } | Event::ChannelUpdate(_)
+                        ) {
+                            visible.clear();
+                        }
                         if let Some(event) = route(&env, me, &mut member_of, &mut subscribed, background) {
-                            s.dispatch(event).await?;
+                            // События закрытого канала — только тем, кто его видит (удаление — всем: уже не проверить)
+                            let hidden = match (target, original.channel_id()) {
+                                (Target::Guild(_), Some(cid)) if !matches!(original, Event::ChannelDelete { .. }) => match visible.get(&cid) {
+                                    Some(v) => !*v,
+                                    None => {
+                                        let v = channel_for_member(&st.db, cid, me).await.is_ok();
+                                        visible.insert(cid, v);
+                                        !v
+                                    }
+                                },
+                                _ => false,
+                            };
+                            if !hidden {
+                                s.dispatch(event).await?;
+                            }
                         }
                     }
                     Err(RecvError::Lagged(n)) => {

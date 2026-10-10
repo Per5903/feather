@@ -19,6 +19,8 @@ pub struct Config {
     pub data_dir: std::path::PathBuf,
     /// Регистрация: open | invite | closed (FEATHER_REGISTRATION)
     pub registration: feather_protocol::RegistrationMode,
+    /// Превью ссылок в сообщениях: сервер сам ходит по ссылкам (FEATHER_LINK_PREVIEWS=0 — выключить)
+    pub link_previews: bool,
 }
 
 impl Config {
@@ -40,6 +42,7 @@ impl Config {
                 "open" => feather_protocol::RegistrationMode::Open,
                 other => panic!("FEATHER_REGISTRATION: open | invite | closed, а не {other}"),
             },
+            link_previews: var("FEATHER_LINK_PREVIEWS", "1") != "0",
         }
     }
 }

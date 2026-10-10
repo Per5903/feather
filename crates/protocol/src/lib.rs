@@ -64,6 +64,16 @@ pub struct User {
     pub id: Snowflake,
     pub username: String,
     pub display_name: Option<String>,
+    /// Версия аватара (`/avatars/{user_id}/{avatar}`); None — буква вместо картинки
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<Snowflake>,
+}
+
+impl User {
+    /// Как показывать: отображаемое имя или логин
+    pub fn shown_name(&self) -> &str {
+        self.display_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&self.username)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -86,9 +96,30 @@ pub mod perms {
     pub const MANAGE_MESSAGES: u64 = 1 << 8;
     pub const VOICE_CONNECT: u64 = 1 << 9;
     pub const VOICE_SPEAK: u64 = 1 << 10;
-    pub const ALL: u64 = (1 << 11) - 1;
+    /// Видеть канал (снимается в настройках канала — получается закрытый канал)
+    pub const VIEW_CHANNEL: u64 = 1 << 11;
+    pub const ALL: u64 = (1 << 12) - 1;
     /// Права @everyone в новом сервере
-    pub const DEFAULT_EVERYONE: u64 = CREATE_INVITE | SEND_MESSAGES | VOICE_CONNECT | VOICE_SPEAK;
+    pub const DEFAULT_EVERYONE: u64 = VIEW_CHANNEL | CREATE_INVITE | SEND_MESSAGES | VOICE_CONNECT | VOICE_SPEAK;
+    /// Права, которые имеет смысл менять на уровне канала
+    pub const CHANNEL_SCOPED: u64 = VIEW_CHANNEL | SEND_MESSAGES | MANAGE_MESSAGES | VOICE_CONNECT | VOICE_SPEAK;
+
+    /// Права в канале: сначала @everyone, затем роли (запреты, потом разрешения), затем сам участник.
+    /// Владелец и администратор не ограничиваются (как в Discord)
+    pub fn apply_overwrites(base: u64, everyone: Option<(u64, u64)>, roles: (u64, u64), member: Option<(u64, u64)>) -> u64 {
+        if base & ADMINISTRATOR != 0 {
+            return ALL;
+        }
+        let mut p = base;
+        if let Some((allow, deny)) = everyone {
+            p = (p & !deny) | allow;
+        }
+        p = (p & !roles.1) | roles.0;
+        if let Some((allow, deny)) = member {
+            p = (p & !deny) | allow;
+        }
+        p
+    }
 
     /// Итоговые права: объединение ролей; администратор — всё
     pub fn resolve(owner: bool, role_perms: impl IntoIterator<Item = u64>) -> u64 {
@@ -135,6 +166,25 @@ pub enum ChannelKind {
     Category,
     /// Личные сообщения (вне серверов)
     Dm,
+    /// Ветка обсуждения: текстовый канал внутри текстового (`parent_id` — родительский канал)
+    Thread,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverwriteKind {
+    Role,
+    Member,
+}
+
+/// Права канала для роли или участника: `allow` добавляет, `deny` убирает
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Overwrite {
+    /// id роли (@everyone — id сервера) или пользователя
+    pub id: Snowflake,
+    pub kind: OverwriteKind,
+    pub allow: u64,
+    pub deny: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -145,6 +195,8 @@ pub struct Channel {
     pub name: String,
     pub parent_id: Option<Snowflake>,
     pub position: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overwrites: Vec<Overwrite>,
 }
 
 /// Личный канал: собеседники (без меня) и последнее сообщение (для сортировки и непрочитанного)
@@ -181,6 +233,57 @@ pub struct Message {
     pub nonce: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<Reaction>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// Ветка, начатая с этого сообщения
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<Snowflake>,
+    /// Превью ссылок (сервер дописывает через MESSAGE_UPDATE через пару секунд после отправки)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embeds: Vec<Embed>,
+}
+
+/// Реакция: эмодзи, сколько человек поставили, есть ли среди них я
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    #[serde(default)]
+    pub me: bool,
+}
+
+/// Превью ссылки (Open Graph)
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Embed {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Забаненный на сервере
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Ban {
+    pub user: User,
+}
+
+/// Запись журнала модерации
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditEntry {
+    pub id: Snowflake,
+    pub actor: User,
+    /// channel_create, channel_update, channel_delete, guild_update, role_create, role_update,
+    /// role_delete, member_role_add, member_role_remove, kick, ban, unban, message_delete,
+    /// overwrite_update, overwrite_delete, invite_create, owner_transfer, message_pin, message_unpin
+    pub action: String,
+    pub target_id: Option<Snowflake>,
+    /// Человекочитаемые подробности: название, имя роли и т.п.
+    pub details: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -220,13 +323,101 @@ pub struct InstanceInfo {
     pub registration: RegistrationMode,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
     /// Название устройства для списка активных сессий («Ноутбук», «Домашний ПК»)
     #[serde(default)]
     pub device_name: Option<String>,
+    /// Код из приложения-аутентификатора, если включена двухфакторная защита.
+    /// Без него сервер ответит ошибкой `totp_required`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<String>,
+}
+
+/// Смена отображаемого имени: пустая строка — сбросить на логин
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateMeRequest {
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current: String,
+    pub new: String,
+}
+
+/// Подтверждение опасного действия паролем (и кодом 2FA, если она включена)
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ConfirmRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<String>,
+}
+
+/// Начало настройки 2FA: секрет и ссылка otpauth:// для QR-кода
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TotpSetup {
+    pub secret: String,
+    pub uri: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TotpCode {
+    pub code: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateGuildRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Передать сообщество другому участнику (только владелец)
+    #[serde(default)]
+    pub owner_id: Option<Snowflake>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateChannelRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub position: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OverwriteRequest {
+    pub kind: OverwriteKind,
+    pub allow: u64,
+    pub deny: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateThreadRequest {
+    pub name: String,
+}
+
+/// Пользователь в панели администратора
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdminUser {
+    pub user: User,
+    pub is_admin: bool,
+    /// Время регистрации, мс Unix
+    pub created_at: i64,
+    pub guilds: i64,
+    pub totp_enabled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminSettings {
+    pub registration: RegistrationMode,
+}
+
+/// Временный пароль после сброса администратором
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TempPassword {
+    pub password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -359,6 +550,9 @@ pub enum ServerOp {
         /// Кто сейчас в голосовых каналах серверов пользователя
         #[serde(default)]
         voice_states: Vec<VoiceState>,
+        /// Я администратор этого сервера Feather (панель администратора)
+        #[serde(default)]
+        admin: bool,
     },
     HeartbeatAck,
     Dispatch { seq: u64, event: Event },
@@ -373,6 +567,15 @@ pub enum Event {
     MessageUpdate(Message),
     MessageDelete { id: Snowflake, channel_id: Snowflake },
     ChannelCreate(Channel),
+    ChannelUpdate(Channel),
+    ChannelDelete { guild_id: Snowflake, channel_id: Snowflake },
+    /// Сменились права (роли, права каналов): видимые каналы могли измениться — перезапросить список
+    ChannelsInvalidated { guild_id: Snowflake },
+    GuildUpdate(Guild),
+    /// Пользователь сменил имя или аватар
+    UserUpdate(User),
+    ReactionAdd { channel_id: Snowflake, message_id: Snowflake, user_id: Snowflake, emoji: String },
+    ReactionRemove { channel_id: Snowflake, message_id: Snowflake, user_id: Snowflake, emoji: String },
     GuildMemberAdd { guild_id: Snowflake, user: User },
     /// Участника выгнали/забанили или он ушёл
     GuildMemberRemove { guild_id: Snowflake, user_id: Snowflake },
@@ -400,7 +603,32 @@ pub enum Event {
 impl Event {
     /// Полное событие или «лёгкое» (для серверов без подписки)
     pub fn is_heavy(&self) -> bool {
-        !matches!(self, Event::GuildCreate(_) | Event::GuildDelete { .. } | Event::DmCreate(_) | Event::UnreadUpdate { .. } | Event::ChannelAck { .. } | Event::VoiceStateUpdate(_))
+        !matches!(
+            self,
+            Event::GuildCreate(_)
+                | Event::GuildDelete { .. }
+                | Event::GuildUpdate(_)
+                | Event::DmCreate(_)
+                | Event::UnreadUpdate { .. }
+                | Event::ChannelAck { .. }
+                | Event::VoiceStateUpdate(_)
+                | Event::UserUpdate(_)
+                | Event::ChannelsInvalidated { .. }
+        )
+    }
+
+    /// Канал, к которому относится событие: сервер проверяет право видеть его перед отправкой
+    pub fn channel_id(&self) -> Option<Snowflake> {
+        match self {
+            Event::MessageCreate(m) | Event::MessageUpdate(m) => Some(m.channel_id),
+            Event::MessageDelete { channel_id, .. }
+            | Event::TypingStart { channel_id, .. }
+            | Event::ReactionAdd { channel_id, .. }
+            | Event::ReactionRemove { channel_id, .. }
+            | Event::ChannelDelete { channel_id, .. } => Some(*channel_id),
+            Event::ChannelCreate(c) | Event::ChannelUpdate(c) => Some(c.id),
+            _ => None,
+        }
     }
 }
 
@@ -423,6 +651,21 @@ mod tests {
         assert_eq!(resolve(true, []), ALL, "владелец может всё");
         assert_eq!(resolve(false, [SEND_MESSAGES, KICK_MEMBERS]), SEND_MESSAGES | KICK_MEMBERS);
         assert_eq!(resolve(false, [ADMINISTRATOR]), ALL);
+    }
+
+    #[test]
+    fn channel_overwrites() {
+        use perms::*;
+        let base = DEFAULT_EVERYONE;
+        // Закрытый канал: @everyone без VIEW, роле «Модер» — можно
+        let hidden = apply_overwrites(base, Some((0, VIEW_CHANNEL)), (0, 0), None);
+        assert_eq!(hidden & VIEW_CHANNEL, 0);
+        let moder = apply_overwrites(base, Some((0, VIEW_CHANNEL)), (VIEW_CHANNEL, 0), None);
+        assert_ne!(moder & VIEW_CHANNEL, 0);
+        // Запрет конкретному участнику сильнее разрешения роли
+        let muted = apply_overwrites(base, None, (SEND_MESSAGES, 0), Some((0, SEND_MESSAGES)));
+        assert_eq!(muted & SEND_MESSAGES, 0);
+        assert_eq!(apply_overwrites(ADMINISTRATOR, Some((0, ALL)), (0, ALL), Some((0, ALL))), ALL);
     }
 
     #[test]

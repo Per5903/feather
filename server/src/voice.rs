@@ -21,13 +21,13 @@ pub async fn join(State(st): State<Shared>, user: AuthUser, Path(channel_id): Pa
     if channel.kind != ChannelKind::Voice {
         return Err(AppError::BadRequest("not_voice_channel", "это не голосовой канал".into()));
     }
-    let p = crate::roles::member_perms(&st.db, channel.guild_id, user.id()).await?.require(perms::VOICE_CONNECT)?;
+    let p = crate::roles::channel_perms(&st.db, &channel, user.id()).await?.require(perms::VOICE_CONNECT)?;
     // Без права «говорить» — только слушать: LiveKit не даст опубликовать микрофон
     let can_speak = p.has(perms::VOICE_SPEAK);
     let room = format!("voice:{channel_id}");
     let token = AccessToken::with_api_key(&st.cfg.livekit_api_key, &st.cfg.livekit_api_secret)
         .with_identity(&user.id().to_string())
-        .with_name(&user.0.username)
+        .with_name(user.0.shown_name())
         .with_ttl(TOKEN_TTL)
         .with_grants(VideoGrants {
             room_join: true,
