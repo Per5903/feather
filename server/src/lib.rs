@@ -48,6 +48,7 @@ pub async fn build(cfg: Config) -> Result<Router, sqlx::Error> {
         db,
         cfg,
     });
+    attachments::spawn_orphan_cleanup(state.clone());
     Ok(router(state))
 }
 

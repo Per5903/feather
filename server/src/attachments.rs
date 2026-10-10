@@ -229,3 +229,27 @@ pub async fn thumbnail(State(st): State<Shared>, user: AuthUser, Path(id): Path<
     let bytes = tokio::fs::read(dir(&st).join(format!("{id}.thumb.jpg"))).await.map_err(|_| AppError::NotFound("превью"))?;
     Ok(file_response(bytes, "image/jpeg", &filename, true))
 }
+
+/// Фоновая уборка: вложения, загруженные, но не отправленные за час, удаляются вместе с файлами
+pub fn spawn_orphan_cleanup(st: Shared) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            let removed: Result<Vec<(i64,)>, _> = sqlx::query_as(
+                "DELETE FROM attachments WHERE message_id IS NULL AND created_at < now() - interval '1 hour' RETURNING id",
+            )
+            .fetch_all(&st.db)
+            .await;
+            match removed {
+                Ok(ids) if !ids.is_empty() => {
+                    let ids: Vec<i64> = ids.into_iter().map(|(i,)| i).collect();
+                    remove_files(&st, &ids).await;
+                    tracing::info!("удалено брошенных вложений: {}", ids.len());
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("уборка вложений: {e}"),
+            }
+        }
+    });
+}
