@@ -19,7 +19,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // WebRTC при подключении проверяет видеодекодер NVIDIA и поднимает контекст CUDA:
     // +80 МБ памяти ради видео, которого в голосе нет (bench/README.md, замер 11).
     // Аппаратное КОДИРОВАНИЕ для демонстрации экрана это не отключает.
-    if std::env::var_os("LK_DISABLE_NVDEC").is_none() {
+    if std::env::var_os("LK_DISABLE_NVDEC").is_none() && std::env::var_os("FEATHER_NVDEC").is_none() {
         // SAFETY: в самом начале main, до запуска других потоков
         unsafe { std::env::set_var("LK_DISABLE_NVDEC", "1") };
     }

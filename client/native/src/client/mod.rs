@@ -1448,6 +1448,9 @@ impl App {
                         app.rebuild_messages();
                         app.scroll_to_bottom_later();
                         app.ack_latest();
+                        if let (Ok(t), Some(ui)) = (std::env::var("FEATHER_TEST_COMPOSER"), app.ui()) {
+                            ui.set_composer_text(t.replace("\\n", "\n").into());
+                        }
                         // Для снимков интерфейса в автотестах: открыть правку своего последнего сообщения
                         if std::env::var_os("FEATHER_TEST_EDIT").is_some()
                             && let Some(i) = app.messages.iter().rposition(|m| m.author.id == app.me.id)
