@@ -18,6 +18,12 @@ export global Theme {
     out property <color> warn: #faa61a;
 }
 
+/// Цветной шрифт эмодзи (задаётся из Rust по системе): иначе шрифтовая система
+/// может отдать чёрно-белый значок из обычного шрифта
+export global Fonts {
+    in property <string> emoji: "Noto Color Emoji";
+}
+
 /// Строка универсального списка: результаты поиска, закреплённые, журнал, баны, пользователи
 export struct ListRow {
     title: string,

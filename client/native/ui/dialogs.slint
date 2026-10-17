@@ -1,7 +1,7 @@
 // Диалоги: аккаунт, сообщество, канал, администратор, громкость, списки (поиск, закреплённые), эмодзи.
 
 import { LineEdit, Button, ComboBox, Slider, ScrollView, Switch } from "std-widgets.slint";
-import { Theme, Avatar, Field, SettingRow, Backdrop, Tabs, ListRow, ListRowView, RoleToggle, LinkButton } from "common.slint";
+import { Theme, Fonts, Avatar, Field, SettingRow, Backdrop, Tabs, ListRow, ListRowView, RoleToggle, LinkButton } from "common.slint";
 
 /// Окно-карточка по центру
 component Card inherits Rectangle {
@@ -445,7 +445,7 @@ export component EmojiPicker inherits Rectangle {
                 height: 36px;
                 clicked => { root.pick(e); }
                 Rectangle { border-radius: 6px; background: eta.has-hover ? Theme.hover : transparent; }
-                Text { text: e; font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
+                Text { text: e; font-size: 22px; font-family: Fonts.emoji; horizontal-alignment: center; vertical-alignment: center; }
             }
         }
     }

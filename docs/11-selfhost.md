@@ -34,15 +34,44 @@ docker compose ps                         # server: healthy
 curl https://chat.example.com/health      # ok
 ```
 
-## Обновление и резервные копии
+## Обновление
 
 ```bash
-git pull && docker compose up -d --build                                  # обновить
-docker compose exec postgres pg_dump -U feather feather > backup.sql      # копия базы
-docker run --rm -v feather_files:/data -v "$PWD":/b alpine tar czf /b/files.tgz -C /data .   # вложения
+git pull && docker compose up -d --build
 ```
 
 Миграции базы применяются автоматически при старте сервера.
+
+На слабом VPS сборка образа долгая и грузит процессор (то, что на нём ещё работает, будет тормозить). Можно собрать образ на своём компьютере и передать готовым:
+
+```bash
+docker build -f server/Dockerfile -t feather-server:local .                     # на своём компьютере
+docker save feather-server:local | gzip | ssh root@сервер 'gunzip | docker load'
+ssh root@сервер 'cd feather/deploy/selfhost && docker compose up -d --no-build server'
+```
+
+## Резервные копии
+
+Служба `backup` раз в сутки кладёт в `deploy/selfhost/backups/` копию базы (`db-ДАТА.dump`) и файлов: вложений и аватаров (`files-ДАТА.tar.gz`). Хранятся последние 7. Настройки в `.env`: `FEATHER_BACKUP_HOURS=24`, `FEATHER_BACKUP_KEEP=7`.
+
+Копии лежат на том же сервере, поэтому от потери самого сервера они не спасут. Время от времени забирайте их к себе:
+
+```bash
+scp -r root@сервер:feather/deploy/selfhost/backups ./feather-backups
+```
+
+Восстановление (сервер Feather на время остановить):
+
+```bash
+docker compose stop server
+docker compose exec -T postgres dropdb -U feather feather
+docker compose exec -T postgres createdb -U feather feather
+docker compose exec -T postgres pg_restore -U feather -d feather < backups/db-ДАТА.dump
+docker run --rm -v feather_files:/data -v "$PWD/backups":/b alpine tar xzf /b/files-ДАТА.tar.gz -C /data
+docker compose start server
+```
+
+Проверено 2026-10-17: копия создаётся, из неё восстанавливается база со всеми сообщениями.
 
 ## Сколько ресурсов
 

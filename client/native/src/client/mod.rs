@@ -1358,6 +1358,30 @@ impl App {
                         } else {
                             app.refresh_channels();
                         }
+                        // Для снимков интерфейса в автотестах: открыть окно
+                        match std::env::var("FEATHER_TEST_DIALOG").as_deref() {
+                            Ok("guild") => app.open_guild_settings(),
+                            Ok("audit") => {
+                                app.open_guild_settings();
+                                let last = app.guild_tabs.len().saturating_sub(1);
+                                if let Some(ui) = app.ui() {
+                                    ui.set_guild_tab(last as i32);
+                                }
+                                app.guild_tab_changed(last);
+                            }
+                            Ok("admin") => app.open_admin(),
+                            Ok("channel") => {
+                                if let Some(i) = app.channels.iter().position(|c| c.kind == Kind::Text) {
+                                    app.open_channel_settings(i);
+                                }
+                            }
+                            Ok("emoji") => {
+                                if let Some(ui) = app.ui() {
+                                    ui.set_emoji_for(-1);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Err(e) => app.set_status(format!("Не удалось загрузить сообщество: {e}")),
                 }

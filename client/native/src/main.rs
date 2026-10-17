@@ -29,6 +29,8 @@ fn main() -> Result<(), slint::PlatformError> {
         unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") };
     }
     let ui = AppWindow::new()?;
+    #[cfg(windows)]
+    ui.global::<Fonts>().set_emoji("Segoe UI Emoji".into());
 
     // Сеть и шлюз живут в tokio; двух потоков чату хватает с запасом (лёгкость — D5)
     let rt = tokio::runtime::Builder::new_multi_thread()

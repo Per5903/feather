@@ -36,7 +36,7 @@ fn audit_text(e: &AuditEntry) -> String {
         "owner_transfer" => "передал(а) сообщество",
         other => other,
     };
-    if e.details.is_empty() { what.to_owned() } else { format!("{what}: {}", e.details) }
+    if e.details.is_empty() { what.to_owned() } else { format!("{what}: {}", render::snippet(&e.details, 200)) }
 }
 
 impl App {

@@ -1046,3 +1046,35 @@ async fn admin_panel() {
     assert_eq!(srv.get::<Guild>(&format!("/guilds/{gid}"), &admin.token).await.0, StatusCode::NOT_FOUND);
     srv.drop_db().await;
 }
+
+#[tokio::test]
+async fn category_permissions_inherited() {
+    let srv = TestServer::start().await;
+    let alice = srv.signup("alice").await;
+    let bob = srv.signup("bob").await;
+    let (_, created) = srv.post::<_, GuildWithChannels>("/guilds", Some(&alice.token), &CreateGuildRequest { name: "Клан".into() }).await;
+    let gid = created.unwrap().guild.id;
+    let (_, invite) = srv.post::<_, Invite>(&format!("/guilds/{gid}/invites"), Some(&alice.token), &CreateInviteRequest::default()).await;
+    srv.post::<_, Guild>(&format!("/invites/{}", invite.unwrap().code), Some(&bob.token), &()).await;
+
+    // Закрытая категория «Офицерская» с двумя каналами: один без своих настроек, другой открыт явно
+    let cat = |name: &str, kind, parent| CreateChannelRequest { name: name.into(), kind, parent_id: parent };
+    let category = srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&alice.token), &cat("Офицерская", ChannelKind::Category, None)).await.1.unwrap().id;
+    let inherited = srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&alice.token), &cat("планы", ChannelKind::Text, Some(category))).await.1.unwrap().id;
+    let open = srv.post::<_, Channel>(&format!("/guilds/{gid}/channels"), Some(&alice.token), &cat("набор", ChannelKind::Text, Some(category))).await.1.unwrap().id;
+    let hide = OverwriteRequest { kind: OverwriteKind::Role, allow: 0, deny: perms::VIEW_CHANNEL };
+    srv.req::<_, Channel>(reqwest::Method::PUT, &format!("/channels/{category}/overwrites/{gid}"), Some(&alice.token), Some(&hide)).await;
+    let show = OverwriteRequest { kind: OverwriteKind::Role, allow: perms::VIEW_CHANNEL, deny: 0 };
+    srv.req::<_, Channel>(reqwest::Method::PUT, &format!("/channels/{open}/overwrites/{gid}"), Some(&alice.token), Some(&show)).await;
+
+    let visible: Vec<Snowflake> = srv.get::<Vec<Channel>>(&format!("/guilds/{gid}/channels"), &bob.token).await.1.unwrap().into_iter().map(|c| c.id).collect();
+    assert!(!visible.contains(&category), "категория закрыта");
+    assert!(!visible.contains(&inherited), "канал без своих настроек наследует закрытость категории");
+    assert!(visible.contains(&open), "канал со своими настройками — открыт");
+    assert_eq!(srv.get::<Vec<Message>>(&format!("/channels/{inherited}/messages"), &bob.token).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(srv.get::<Vec<Message>>(&format!("/channels/{open}/messages"), &bob.token).await.0, StatusCode::OK);
+    // Владелец видит всё
+    let all: Vec<Snowflake> = srv.get::<Vec<Channel>>(&format!("/guilds/{gid}/channels"), &alice.token).await.1.unwrap().into_iter().map(|c| c.id).collect();
+    assert!(all.contains(&inherited) && all.contains(&category));
+    srv.drop_db().await;
+}

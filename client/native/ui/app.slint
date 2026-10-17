@@ -2,10 +2,10 @@
 // никаких тяжёлых эффектов, анимации только простые, списки виртуализированы.
 
 import { ListView, LineEdit, Button, ComboBox, Switch } from "std-widgets.slint";
-import { Theme, Avatar, Icon, IconButton, Field, SettingRow, Backdrop, LinkButton, ListRow, RoleToggle, MentionItem } from "common.slint";
+import { Theme, Fonts, Avatar, Icon, IconButton, Field, SettingRow, Backdrop, LinkButton, ListRow, RoleToggle, MentionItem } from "common.slint";
 import { AccountDialog, GuildSettingsDialog, ChannelSettingsDialog, AdminDialog, VolumeDialog, MessageListDialog, EmojiPicker, ScreenDialog } from "dialogs.slint";
 
-export { ListRow, RoleToggle, MentionItem }
+export { ListRow, RoleToggle, MentionItem, Fonts }
 
 export struct ReactionChip {
     emoji: string,
@@ -261,6 +261,8 @@ component MessageRow inherits TouchArea {
                                     height: et.preferred-height;
                                     clicked => { root.open-embed(); }
                                     et := Text {
+                                        width: parent.width;
+                                        horizontal-alignment: left;
                                         text: m.embed-title;
                                         color: eta.has-hover ? Theme.text : Theme.accent;
                                         font-weight: 600;
@@ -351,7 +353,7 @@ component MessageRow inherits TouchArea {
                     padding-top: 4px;
                     spacing: 4px;
                     for r in m.reactions: rta := TouchArea {
-                        width: rl.preferred-width + 16px;
+                        width: rl.preferred-width;
                         height: 24px;
                         clicked => { root.toggle-reaction(r.emoji); }
                         Rectangle {
@@ -360,12 +362,12 @@ component MessageRow inherits TouchArea {
                             border-width: 1px;
                             border-color: r.me ? Theme.accent : transparent;
                         }
-                        rl := Text {
-                            text: r.emoji + " " + r.count;
-                            color: r.me ? Theme.text : Theme.dim;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        rl := HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 9px;
+                            spacing: 4px;
+                            Text { text: r.emoji; font-family: Fonts.emoji; font-size: 14px; vertical-alignment: center; }
+                            Text { text: r.count; color: r.me ? Theme.text : Theme.dim; font-size: 13px; vertical-alignment: center; }
                         }
                     }
                 }

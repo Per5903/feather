@@ -70,6 +70,39 @@ services:
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
 
+  # Резервные копии: база и файлы раз в FEATHER_BACKUP_HOURS часов (24) в ./backups,
+  # хранятся последние FEATHER_BACKUP_KEEP (7). Восстановление — docs/11-selfhost.md
+  backup:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      HOURS: ${FEATHER_BACKUP_HOURS:-24}
+      KEEP: ${FEATHER_BACKUP_KEEP:-7}
+    volumes:
+      - ./backups:/backups
+      - files:/files:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 60
+        while true; do
+          t=$$(date +%Y%m%d-%H%M)
+          if pg_dump -h postgres -U feather -Fc feather > /backups/db-$$t.dump.tmp; then
+            mv /backups/db-$$t.dump.tmp /backups/db-$$t.dump
+            tar -czf /backups/files-$$t.tar.gz -C /files . && echo "копия $$t готова"
+          else
+            rm -f /backups/db-$$t.dump.tmp; echo "копия базы $$t не удалась"
+          fi
+          # Старые копии: оставляем последние KEEP
+          ls -1t /backups/db-*.dump 2>/dev/null | tail -n +$$((KEEP + 1)) | xargs -r rm -f
+          ls -1t /backups/files-*.tar.gz 2>/dev/null | tail -n +$$((KEEP + 1)) | xargs -r rm -f
+          sleep $$((HOURS * 3600))
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:
   caddy_data:
