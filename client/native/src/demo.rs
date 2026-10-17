@@ -86,7 +86,7 @@ pub fn run(ui: &AppWindow) -> Vec<Timer> {
         guild("WoW", false),
         guild("CS", false),
     ])));
-    let ch = |name: &str, kind, active| ChannelItem { name: name.into(), kind, active, unread: false, voice_members: Default::default(), can_add: false };
+    let ch = |name: &str, kind, active| ChannelItem { name: name.into(), kind, active, unread: false, voice_members: Default::default(), can_manage: false, private: false, can_add: false };
     ui.set_channels(ModelRc::new(VecModel::from(vec![
         ch("ТЕКСТОВЫЕ", ChannelKind::Category, false),
         ch("общий", ChannelKind::Text, true),
@@ -99,7 +99,7 @@ pub fn run(ui: &AppWindow) -> Vec<Timer> {
         ch("AFK", ChannelKind::Voice, false),
     ])));
     ui.set_members(ModelRc::new(VecModel::from(
-        users.iter().map(|u| Member { name: u.name.into(), initial: initial(u.name), tint: color(u.color), can_message: false, can_kick: false, can_roles: false }).collect::<Vec<_>>(),
+        users.iter().map(|u| Member { avatar: Default::default(), has_avatar: false, can_ban: false, name: u.name.into(), initial: initial(u.name), tint: color(u.color), can_message: false, can_kick: false, can_roles: false }).collect::<Vec<_>>(),
     )));
     ui.set_me_name(users[0].name.into());
     ui.set_me_initial(initial(users[0].name));

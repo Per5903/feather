@@ -7,6 +7,8 @@ pub mod files;
 pub mod gateway;
 pub mod hotkey;
 pub mod notify;
+pub mod secrets;
+pub mod update;
 pub mod voice;
 
 pub use api::{Api, Error};

@@ -68,27 +68,43 @@ pub async fn member_perms(db: &PgPool, guild: Snowflake, user: Snowflake) -> Api
 }
 
 /// Права в конкретном канале: права на сервере с учётом настроек канала.
-/// У ветки — настройки родительского канала
+/// Ветка берёт настройки родительского канала; канал без своих настроек — настройки категории
 pub async fn channel_perms(db: &PgPool, channel: &Channel, user: Snowflake) -> ApiResult<Perms> {
     let mut p = member_perms(db, channel.guild_id, user).await?;
     if p.owner || p.bits & perms::ADMINISTRATOR != 0 {
         return Ok(p);
     }
-    let source = if channel.kind == ChannelKind::Thread { channel.parent_id.unwrap_or(channel.id) } else { channel.id };
-    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
-        "SELECT o.target_id, o.kind, o.allow, o.deny FROM channel_overwrites o
-          WHERE o.channel_id = $1 AND (
-                o.target_id = $2 OR o.target_id = $3
-             OR (o.kind = 'role' AND o.target_id IN (SELECT role_id FROM member_roles WHERE guild_id = $3 AND user_id = $2)))",
-    )
-    .bind(source.0 as i64)
-    .bind(user.0 as i64)
-    .bind(channel.guild_id.0 as i64)
-    .fetch_all(db)
-    .await?;
-    if rows.is_empty() {
-        return Ok(p);
-    }
+    // Цепочка: сам канал (или родитель ветки) → его категория; берём первый, у кого есть настройки
+    let mut source = if channel.kind == ChannelKind::Thread { channel.parent_id.unwrap_or(channel.id) } else { channel.id };
+    let rows: Vec<(i64, String, i64, i64)> = loop {
+        let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT o.target_id, o.kind, o.allow, o.deny FROM channel_overwrites o
+              WHERE o.channel_id = $1 AND (
+                    o.target_id = $2 OR o.target_id = $3
+                 OR (o.kind = 'role' AND o.target_id IN (SELECT role_id FROM member_roles WHERE guild_id = $3 AND user_id = $2)))",
+        )
+        .bind(source.0 as i64)
+        .bind(user.0 as i64)
+        .bind(channel.guild_id.0 as i64)
+        .fetch_all(db)
+        .await?;
+        if !rows.is_empty() {
+            break rows;
+        }
+        // Есть ли у источника вообще настройки (может, не для меня) — тогда наследовать нечего
+        let (any,): (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM channel_overwrites WHERE channel_id = $1)")
+            .bind(source.0 as i64)
+            .fetch_one(db)
+            .await?;
+        let parent: Option<(Option<i64>,)> = sqlx::query_as("SELECT parent_id FROM channels WHERE id = $1 AND kind <> 'category'")
+            .bind(source.0 as i64)
+            .fetch_optional(db)
+            .await?;
+        match parent.and_then(|p| p.0) {
+            Some(cat) if !any => source = Snowflake(cat as u64),
+            _ => return Ok(p),
+        }
+    };
     let guild = channel.guild_id.0 as i64;
     let mut everyone = None;
     let mut member = None;
@@ -124,11 +140,15 @@ pub async fn visible_channels(db: &PgPool, guild: Snowflake, user: Snowflake, ch
     let my_roles: std::collections::HashSet<u64> = my_roles.into_iter().map(|(r,)| r as u64).collect();
     let mut out = Vec::new();
     for c in channels {
-        let source = if c.kind == ChannelKind::Thread {
-            channels.iter().find(|p| Some(p.id) == c.parent_id).unwrap_or(c)
-        } else {
-            c
-        };
+        // Та же цепочка, что в channel_perms: ветка → её канал → категория без своих настроек
+        let find = |id: Option<Snowflake>| id.and_then(|id| channels.iter().find(|p| p.id == id));
+        let mut source = if c.kind == ChannelKind::Thread { find(c.parent_id).unwrap_or(c) } else { c };
+        if source.overwrites.is_empty()
+            && source.kind != ChannelKind::Category
+            && let Some(cat) = find(source.parent_id)
+        {
+            source = cat;
+        }
         let (mut everyone, mut member, mut roles) = (None, None, (0u64, 0u64));
         for o in &source.overwrites {
             match o.kind {

@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 #[derive(Debug)]
 pub enum GatewayEvent {
     /// Подключились (или переподключились): клиенту нужно заново подписаться на открытый сервер
-    Ready { user: User, guilds: Vec<Guild>, unread: Vec<UnreadChannel>, voice_states: Vec<VoiceState> },
+    Ready { user: User, guilds: Vec<Guild>, unread: Vec<UnreadChannel>, voice_states: Vec<VoiceState>, admin: bool },
     Event(Event),
     /// Связь потеряна, идёт переподключение
     Reconnecting(String),
@@ -96,9 +96,9 @@ async fn session(
                         heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
                         heartbeat.tick().await;
                     }
-                    Ok(ServerOp::Ready { user, guilds, unread, voice_states, .. }) => {
+                    Ok(ServerOp::Ready { user, guilds, unread, voice_states, admin, .. }) => {
                         ready = true;
-                        on_event(GatewayEvent::Ready { user, guilds, unread, voice_states });
+                        on_event(GatewayEvent::Ready { user, guilds, unread, voice_states, admin });
                     }
                     Ok(ServerOp::Dispatch { seq: s, event }) => {
                         seq = s;

@@ -1,0 +1,446 @@
+// Диалоги: аккаунт, сообщество, канал, администратор, громкость, списки (поиск, закреплённые), эмодзи.
+
+import { LineEdit, Button, ComboBox, Slider, ScrollView, Switch } from "std-widgets.slint";
+import { Theme, Avatar, Field, SettingRow, Backdrop, Tabs, ListRow, ListRowView, RoleToggle, LinkButton } from "common.slint";
+
+/// Окно-карточка по центру
+component Card inherits Rectangle {
+    in property <length> card-width: 460px;
+    in property <length> card-height: 0px;
+    // Сам занимает всё затемнение, карточка — по центру
+    Rectangle {
+        width: card-width;
+        height: card-height > 0 ? card-height : inner.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Theme.bg1;
+        border-radius: 10px;
+        inner := VerticalLayout {
+            padding: 22px;
+            spacing: 12px;
+            @children
+        }
+    }
+}
+
+component Title inherits Text {
+    color: Theme.text;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+component Hint inherits Text {
+    color: Theme.dim;
+    font-size: 12px;
+    wrap: word-wrap;
+}
+
+component ErrorText inherits Text {
+    color: Theme.danger;
+    font-size: 13px;
+    wrap: word-wrap;
+}
+
+/// Аккаунт: профиль, пароль, двухфакторная защита, удаление
+export component AccountDialog inherits Backdrop {
+    in-out property <int> tab;
+    in property <string> username;
+    in-out property <string> display-name;
+    in property <string> initial;
+    in property <color> tint;
+    in property <image> avatar;
+    in property <bool> has-avatar;
+    in-out property <string> pw-current;
+    in-out property <string> pw-new;
+    in-out property <string> pw-new2;
+    /// 2FA: включена; идёт настройка (показан QR)
+    in property <bool> totp-enabled;
+    in property <bool> totp-setup;
+    in property <image> totp-qr;
+    in property <string> totp-secret;
+    in-out property <string> totp-code;
+    in-out property <string> confirm-password;
+    in property <string> message;
+    in property <bool> message-ok;
+    callback save-profile();
+    callback pick-avatar();
+    callback remove-avatar();
+    callback change-password();
+    callback start-totp();
+    callback enable-totp();
+    callback disable-totp();
+    callback delete-account();
+    callback close();
+    Card {
+        card-width: 500px;
+        Title { text: "Мой аккаунт"; }
+        Tabs { labels: ["Профиль", "Пароль", "Защита", "Удаление"]; current <=> root.tab; }
+        if tab == 0: VerticalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 16px;
+                Avatar { size: 72px; initial: root.initial; tint: root.tint; image: root.avatar; has-image: root.has-avatar; }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    Text { text: "@" + username; color: Theme.dim; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button { text: "Сменить аватар…"; clicked => { root.pick-avatar(); } }
+                        if has-avatar: Button { text: "Убрать"; clicked => { root.remove-avatar(); } }
+                    }
+                }
+            }
+            Field {
+                label: "ОТОБРАЖАЕМОЕ ИМЯ";
+                LineEdit { text <=> root.display-name; placeholder-text: username; accepted => { root.save-profile(); } }
+            }
+            Hint { text: "Так вас видят в чате и голосе. Пусто — показывается логин. Войти по-прежнему можно только с логином."; }
+            HorizontalLayout { alignment: end; Button { text: "Сохранить"; primary: true; clicked => { root.save-profile(); } } }
+        }
+        if tab == 1: VerticalLayout {
+            spacing: 12px;
+            Field { label: "ТЕКУЩИЙ ПАРОЛЬ"; LineEdit { text <=> root.pw-current; input-type: InputType.password; } }
+            Field { label: "НОВЫЙ ПАРОЛЬ"; LineEdit { text <=> root.pw-new; input-type: InputType.password; } }
+            Field { label: "ПОВТОРИТЕ НОВЫЙ"; LineEdit { text <=> root.pw-new2; input-type: InputType.password; accepted => { root.change-password(); } } }
+            Hint { text: "На других устройствах после смены пароля нужно будет войти заново."; }
+            HorizontalLayout { alignment: end; Button { text: "Сменить пароль"; primary: true; clicked => { root.change-password(); } } }
+        }
+        if tab == 2: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: totp-enabled ? "Двухфакторная защита включена" : "Двухфакторная защита выключена";
+                color: totp-enabled ? Theme.ok : Theme.text;
+                font-weight: 600;
+            }
+            Hint { text: "При входе кроме пароля понадобится шестизначный код из приложения на телефоне (Google Authenticator, Aegis, 2FAS и т.п.). Украденного пароля станет мало."; }
+            if !totp-enabled && !totp-setup: HorizontalLayout { alignment: start; Button { text: "Включить"; primary: true; clicked => { root.start-totp(); } } }
+            if totp-setup: VerticalLayout {
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 14px;
+                    Rectangle {
+                        width: 168px;
+                        height: 168px;
+                        background: #fff;
+                        border-radius: 6px;
+                        Image { x: 4px; y: 4px; width: 160px; height: 160px; source: totp-qr; image-rendering: pixelated; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        Hint { text: "1. Отсканируйте QR-код в приложении-аутентификаторе. Или введите ключ вручную:"; }
+                        Text { text: totp-secret; color: Theme.text; font-family: "monospace"; font-size: 13px; wrap: word-wrap; }
+                        Hint { text: "2. Введите код, который покажет приложение."; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { text <=> root.totp-code; placeholder-text: "123456"; accepted => { root.enable-totp(); } }
+                    Button { text: "Подтвердить"; primary: true; clicked => { root.enable-totp(); } }
+                }
+            }
+            if totp-enabled: VerticalLayout {
+                spacing: 8px;
+                Hint { text: "Чтобы выключить, введите пароль и текущий код:"; }
+                LineEdit { text <=> root.confirm-password; input-type: InputType.password; placeholder-text: "пароль"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { text <=> root.totp-code; placeholder-text: "код"; }
+                    Button { text: "Выключить"; clicked => { root.disable-totp(); } }
+                }
+            }
+        }
+        if tab == 3: VerticalLayout {
+            spacing: 12px;
+            Text { text: "Удалить аккаунт навсегда"; color: Theme.danger; font-weight: 600; }
+            Hint { text: "Имя, аватар и вход будут удалены, вы выйдете из всех сообществ. Ваши сообщения останутся с подписью «Удалённый аккаунт». Свои сообщества сначала передайте другому участнику или удалите (настройки сообщества)."; }
+            LineEdit { text <=> root.confirm-password; input-type: InputType.password; placeholder-text: "пароль"; }
+            if totp-enabled: LineEdit { text <=> root.totp-code; placeholder-text: "код из приложения"; }
+            HorizontalLayout { alignment: end; Button { text: "Удалить аккаунт"; clicked => { root.delete-account(); } } }
+        }
+        if message != "": Text { text: message; color: message-ok ? Theme.ok : Theme.danger; font-size: 13px; wrap: word-wrap; }
+        HorizontalLayout { alignment: end; Button { text: "Закрыть"; clicked => { root.close(); } } }
+    }
+}
+
+/// Настройки сообщества: название, владелец, удаление; баны; журнал модерации
+export component GuildSettingsDialog inherits Backdrop {
+    in-out property <int> tab;
+    in property <[string]> tab-labels;
+    in-out property <string> name;
+    in property <bool> can-manage;
+    in property <bool> is-owner;
+    in property <[string]> member-names;
+    in-out property <int> new-owner;
+    in-out property <string> confirm-name;
+    in property <[ListRow]> bans;
+    in property <[ListRow]> audit;
+    in property <string> message;
+    in property <bool> message-ok;
+    callback save-name();
+    callback transfer();
+    callback delete-guild();
+    callback leave();
+    callback unban(int);
+    callback close();
+    Card {
+        card-width: 560px;
+        card-height: 560px;
+        Title { text: "Настройки сообщества"; }
+        Tabs { labels: tab-labels; current <=> root.tab; }
+        if tab == 0: VerticalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+            if can-manage: Field {
+                label: "НАЗВАНИЕ";
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { text <=> root.name; accepted => { root.save-name(); } }
+                    Button { text: "Сохранить"; primary: true; clicked => { root.save-name(); } }
+                }
+            }
+            if is-owner: Field {
+                label: "ПЕРЕДАТЬ СООБЩЕСТВО";
+                HorizontalLayout {
+                    spacing: 8px;
+                    ComboBox { model: member-names; current-index <=> root.new-owner; horizontal-stretch: 1; }
+                    Button { text: "Передать"; clicked => { root.transfer(); } }
+                }
+                Hint { text: "Новый владелец получит все права, вы останетесь обычным участником."; }
+            }
+            if is-owner: Field {
+                label: "УДАЛИТЬ СООБЩЕСТВО";
+                Hint { text: "Все каналы, сообщения и файлы будут удалены навсегда. Введите название сообщества для подтверждения."; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { text <=> root.confirm-name; placeholder-text: "название"; }
+                    Button { text: "Удалить навсегда"; clicked => { root.delete-guild(); } }
+                }
+            }
+            if !is-owner: Field {
+                label: "ПОКИНУТЬ СООБЩЕСТВО";
+                Hint { text: "Вернуться можно будет только по новому приглашению."; }
+                HorizontalLayout { alignment: start; Button { text: "Покинуть"; clicked => { root.leave(); } } }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+        if tab == 1: VerticalLayout {
+            vertical-stretch: 1;
+            if bans.length == 0: Hint { text: "Забаненных нет. Забанить можно в списке участников (наведите на участника)."; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    alignment: start;
+                    for b[i] in bans: ListRowView { item: b; action => { root.unban(i); } }
+                }
+            }
+        }
+        if tab == 2: VerticalLayout {
+            vertical-stretch: 1;
+            if audit.length == 0: Hint { text: "Записей пока нет."; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    alignment: start;
+                    for a in audit: ListRowView { item: a; }
+                }
+            }
+        }
+        if message != "": Text { text: message; color: message-ok ? Theme.ok : Theme.danger; font-size: 13px; wrap: word-wrap; }
+        HorizontalLayout { alignment: end; Button { text: "Закрыть"; clicked => { root.close(); } } }
+    }
+}
+
+/// Настройки канала: название, кто видит и кто пишет
+export component ChannelSettingsDialog inherits Backdrop {
+    in-out property <string> name;
+    in property <bool> is-voice;
+    in property <bool> is-category;
+    in-out property <bool> private;
+    in-out property <bool> read-only;
+    in property <[RoleToggle]> roles;
+    in property <string> message;
+    callback save();
+    callback delete-channel();
+    callback close();
+    Card {
+        card-width: 520px;
+        Title { text: is-category ? "Настройки категории" : "Настройки канала"; }
+        Field { label: "НАЗВАНИЕ"; LineEdit { text <=> root.name; } }
+        SettingRow {
+            title: "Закрытый";
+            hint: is-category ? "Каналы категории видят только выбранные роли (если у канала нет своих настроек)" : "Канал видят только выбранные ниже роли";
+            checked <=> root.private;
+        }
+        if !is-voice && !is-category: SettingRow {
+            title: "Только чтение";
+            hint: "Писать могут только выбранные ниже роли — для объявлений";
+            checked <=> root.read-only;
+        }
+        if (private || read-only) && roles.length > 0: VerticalLayout {
+            spacing: 4px;
+            Text { text: "РОЛИ"; color: Theme.dim; font-size: 12px; font-weight: 600; }
+            for r in roles: HorizontalLayout {
+                spacing: 10px;
+                height: 32px;
+                Text { text: r.name; color: r.tint; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                if private: Text { text: "видит"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                if private: Switch { checked <=> r.view; }
+                if read-only && !is-voice && !is-category: Text { text: "пишет"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                if read-only && !is-voice && !is-category: Switch { checked <=> r.send; }
+            }
+        }
+        if private && roles.length == 0: Hint { text: "Ролей нет: канал будут видеть только владелец и администраторы. Создайте роль в «Ролях сервера»."; }
+        if message != "": ErrorText { text: message; }
+        HorizontalLayout {
+            spacing: 8px;
+            Button { text: "Удалить"; clicked => { root.delete-channel(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Отмена"; clicked => { root.close(); } }
+            Button { text: "Сохранить"; primary: true; clicked => { root.save(); } }
+        }
+    }
+}
+
+/// Панель администратора сервера Feather
+export component AdminDialog inherits Backdrop {
+    in-out property <int> registration;
+    in property <[ListRow]> users;
+    in property <string> message;
+    in property <bool> message-ok;
+    callback set-registration(int);
+    callback reset-password(int);
+    callback delete-user(int);
+    callback close();
+    Card {
+        card-width: 600px;
+        card-height: 600px;
+        Title { text: "Администрирование сервера"; }
+        Field {
+            label: "РЕГИСТРАЦИЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ";
+            ComboBox {
+                model: ["Открытая — любой, кто знает адрес", "По приглашению — нужен код", "Закрыта"];
+                current-index <=> root.registration;
+                selected => { root.set-registration(self.current-index); }
+            }
+        }
+        Text { text: "ПОЛЬЗОВАТЕЛИ — " + users.length; color: Theme.dim; font-size: 12px; font-weight: 600; }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                for u[i] in users: ListRowView { item: u; action => { root.reset-password(i); } action2 => { root.delete-user(i); } }
+            }
+        }
+        if message != "": Text { text: message; color: message-ok ? Theme.ok : Theme.danger; font-size: 13px; wrap: word-wrap; }
+        HorizontalLayout { alignment: end; Button { text: "Закрыть"; clicked => { root.close(); } } }
+    }
+}
+
+/// Громкость участника голосового канала
+export component VolumeDialog inherits Backdrop {
+    in property <string> name;
+    in-out property <float> volume;
+    callback changed(float);
+    callback close();
+    Card {
+        card-width: 380px;
+        Title { text: "Громкость: " + name; }
+        HorizontalLayout {
+            spacing: 12px;
+            Slider {
+                minimum: 0;
+                maximum: 200;
+                value <=> root.volume;
+                changed(v) => { root.changed(v); }
+            }
+            Text { text: Math.round(volume) + "%"; color: Theme.text; vertical-alignment: center; min-width: 48px; }
+        }
+        Hint { text: "Только у вас: другие слышат этого человека как обычно."; }
+        HorizontalLayout {
+            spacing: 8px;
+            Button { text: "100%"; clicked => { root.volume = 100; root.changed(100); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Готово"; primary: true; clicked => { root.close(); } }
+        }
+    }
+}
+
+/// Список сообщений: результаты поиска или закреплённые
+export component MessageListDialog inherits Backdrop {
+    in property <string> title;
+    in property <string> empty-text;
+    in property <[ListRow]> rows;
+    in-out property <string> query;
+    in property <bool> searchable;
+    callback search();
+    callback open(int);
+    callback action(int);
+    callback close();
+    Card {
+        card-width: 600px;
+        card-height: 600px;
+        Title { text: root.title; }
+        if searchable: HorizontalLayout {
+            spacing: 8px;
+            LineEdit { text <=> root.query; placeholder-text: "Что искать"; accepted => { root.search(); } }
+            Button { text: "Найти"; primary: true; clicked => { root.search(); } }
+        }
+        if rows.length == 0: Hint { text: empty-text; }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                for r[i] in rows: ListRowView {
+                    item: r;
+                    clickable: true;
+                    clicked => { root.open(i); }
+                    action => { root.action(i); }
+                }
+            }
+        }
+        HorizontalLayout { alignment: end; Button { text: "Закрыть"; clicked => { root.close(); } } }
+    }
+}
+
+/// Эмодзи: для поля ввода или реакции на сообщение
+export component EmojiPicker inherits Rectangle {
+    in property <string> title;
+    callback pick(string);
+    callback close();
+    property <[string]> emojis: [
+        "👍", "👎", "❤️", "🔥", "😂", "🤣", "😊", "😍", "😎", "🤔", "😮", "😢",
+        "😭", "😡", "🤬", "🙏", "👏", "🎉", "💯", "✅", "❌", "⚡", "💀", "👀",
+        "🙂", "😉", "😅", "😁", "😴", "🤝", "💪", "🤡", "🥳", "😱", "🤯", "😬",
+        "🎮", "🕹️", "🏆", "🎯", "⚔️", "🛡️", "🗡️", "🏹", "💣", "🧠", "👑", "🍕",
+        "🍺", "☕", "🚀", "⭐", "🌙", "☀️", "❄️", "💎", "💰", "📌", "🔔", "❓",
+    ];
+    width: 8 * 38px + 20px;
+    height: 8 * 38px + 40px;
+    background: Theme.bg1;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
+    TouchArea { }
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalLayout {
+            Text { text: title; color: Theme.dim; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+            LinkButton { text: "×"; font-size: 18px; color: Theme.dim; clicked => { root.close(); } }
+        }
+        Rectangle {
+            for e[i] in emojis: eta := TouchArea {
+                x: mod(i, 8) * 38px;
+                y: floor(i / 8) * 38px;
+                width: 36px;
+                height: 36px;
+                clicked => { root.pick(e); }
+                Rectangle { border-radius: 6px; background: eta.has-hover ? Theme.hover : transparent; }
+                Text { text: e; font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+    }
+}

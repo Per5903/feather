@@ -19,6 +19,19 @@ impl Error {
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Error::Api { status: 401, .. })
     }
+
+    /// Код ошибки сервера (`totp_required`, `owns_guilds`, …)
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Error::Api { code, .. } => Some(code),
+            Error::Network(_) => None,
+        }
+    }
+}
+
+/// Эмодзи и прочее в пути адреса
+fn path_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 impl fmt::Display for Error {
@@ -111,8 +124,8 @@ impl Api {
         self.call(Method::POST, "/auth/register", Some(&req)).await
     }
 
-    pub async fn login(&self, username: &str, password: &str, device: &str) -> Result<LoginResponse> {
-        let req = LoginRequest { username: username.into(), password: password.into(), device_name: Some(device.into()) };
+    pub async fn login(&self, username: &str, password: &str, device: &str, totp: Option<&str>) -> Result<LoginResponse> {
+        let req = LoginRequest { username: username.into(), password: password.into(), device_name: Some(device.into()), totp: totp.map(Into::into) };
         self.call(Method::POST, "/auth/login", Some(&req)).await
     }
 
@@ -223,6 +236,172 @@ impl Api {
     pub async fn send_with_attachments(&self, channel: Snowflake, content: &str, nonce: String, attachments: Vec<Snowflake>) -> Result<Message> {
         let req = SendMessageRequest { content: content.into(), nonce: Some(nonce), attachment_ids: attachments, ..Default::default() };
         self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(&req)).await
+    }
+
+    pub async fn send_full(&self, channel: Snowflake, req: &SendMessageRequest) -> Result<Message> {
+        self.call(Method::POST, &format!("/channels/{channel}/messages"), Some(req)).await
+    }
+
+    // ---------------------------------------------------------------- аккаунт
+
+    pub async fn update_me(&self, display_name: &str) -> Result<User> {
+        self.call(Method::PATCH, "/users/@me", Some(&UpdateMeRequest { display_name: Some(display_name.into()) })).await
+    }
+
+    pub async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+        self.call(Method::POST, "/users/@me/password", Some(&ChangePasswordRequest { current: current.into(), new: new.into() })).await
+    }
+
+    pub async fn set_avatar(&self, bytes: Vec<u8>) -> Result<User> {
+        let mut req = self.http.put(format!("{}/api/v1/users/@me/avatar", self.base)).body(bytes).timeout(std::time::Duration::from_secs(60));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
+        if status.is_success() {
+            return serde_json::from_slice(&body).map_err(|e| Error::Network(e.to_string()));
+        }
+        let err: ApiError = serde_json::from_slice(&body).unwrap_or(ApiError { code: "http".into(), message: format!("ошибка сервера {status}") });
+        Err(Error::Api { status: status.as_u16(), code: err.code, message: err.message })
+    }
+
+    pub async fn remove_avatar(&self) -> Result<User> {
+        self.call::<(), _>(Method::DELETE, "/users/@me/avatar", None).await
+    }
+
+    /// Аватар пользователя (PNG 128×128)
+    pub async fn avatar(&self, user: Snowflake, version: Snowflake) -> Result<Vec<u8>> {
+        self.get_bytes(&format!("/avatars/{user}/{version}")).await
+    }
+
+    pub async fn totp_status(&self) -> Result<bool> {
+        self.call::<(), _>(Method::GET, "/users/@me/2fa", None).await
+    }
+
+    pub async fn totp_setup(&self) -> Result<TotpSetup> {
+        self.call::<(), _>(Method::POST, "/users/@me/2fa/setup", None).await
+    }
+
+    pub async fn totp_enable(&self, code: &str) -> Result<()> {
+        self.call(Method::POST, "/users/@me/2fa/enable", Some(&TotpCode { code: code.into() })).await
+    }
+
+    pub async fn totp_disable(&self, password: &str, code: &str) -> Result<()> {
+        let req = ConfirmRequest { password: password.into(), totp: Some(code.into()) };
+        self.call(Method::DELETE, "/users/@me/2fa", Some(&req)).await
+    }
+
+    pub async fn delete_account(&self, password: &str, code: Option<&str>) -> Result<()> {
+        let req = ConfirmRequest { password: password.into(), totp: code.map(Into::into) };
+        self.call(Method::DELETE, "/users/@me", Some(&req)).await
+    }
+
+    // ---------------------------------------------------------------- сообщества и каналы
+
+    pub async fn update_guild(&self, guild: Snowflake, req: &UpdateGuildRequest) -> Result<Guild> {
+        self.call(Method::PATCH, &format!("/guilds/{guild}"), Some(req)).await
+    }
+
+    pub async fn delete_guild(&self, guild: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/guilds/{guild}"), None).await
+    }
+
+    pub async fn update_channel(&self, channel: Snowflake, req: &UpdateChannelRequest) -> Result<Channel> {
+        self.call(Method::PATCH, &format!("/channels/{channel}"), Some(req)).await
+    }
+
+    pub async fn delete_channel(&self, channel: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/channels/{channel}"), None).await
+    }
+
+    pub async fn put_overwrite(&self, channel: Snowflake, target: Snowflake, req: &OverwriteRequest) -> Result<Channel> {
+        self.call(Method::PUT, &format!("/channels/{channel}/overwrites/{target}"), Some(req)).await
+    }
+
+    pub async fn delete_overwrite(&self, channel: Snowflake, target: Snowflake) -> Result<Channel> {
+        self.call::<(), _>(Method::DELETE, &format!("/channels/{channel}/overwrites/{target}"), None).await
+    }
+
+    pub async fn bans(&self, guild: Snowflake) -> Result<Vec<Ban>> {
+        self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/bans"), None).await
+    }
+
+    pub async fn ban(&self, guild: Snowflake, user: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::PUT, &format!("/guilds/{guild}/bans/{user}"), None).await
+    }
+
+    pub async fn unban(&self, guild: Snowflake, user: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/guilds/{guild}/bans/{user}"), None).await
+    }
+
+    pub async fn audit_log(&self, guild: Snowflake) -> Result<Vec<AuditEntry>> {
+        self.call::<(), _>(Method::GET, &format!("/guilds/{guild}/audit-log"), None).await
+    }
+
+    // ---------------------------------------------------------------- сообщения
+
+    pub async fn react(&self, channel: Snowflake, message: Snowflake, emoji: &str, add: bool) -> Result<()> {
+        let method = if add { Method::PUT } else { Method::DELETE };
+        self.call::<(), ()>(method, &format!("/channels/{channel}/messages/{message}/reactions/{}", path_escape(emoji)), None).await
+    }
+
+    pub async fn pin(&self, channel: Snowflake, message: Snowflake, on: bool) -> Result<()> {
+        let method = if on { Method::PUT } else { Method::DELETE };
+        self.call::<(), ()>(method, &format!("/channels/{channel}/pins/{message}"), None).await
+    }
+
+    pub async fn pins(&self, channel: Snowflake) -> Result<Vec<Message>> {
+        self.call::<(), _>(Method::GET, &format!("/channels/{channel}/pins"), None).await
+    }
+
+    /// Поиск: по сообществу (`guild`) или по одному каналу
+    pub async fn search(&self, guild: Option<Snowflake>, channel: Snowflake, query: &str) -> Result<Vec<Message>> {
+        let base = match guild {
+            Some(g) => format!("/guilds/{g}/search"),
+            None => format!("/channels/{channel}/search"),
+        };
+        self.call::<(), _>(Method::GET, &format!("{base}?q={}", path_escape(query)), None).await
+    }
+
+    pub async fn create_thread(&self, channel: Snowflake, message: Snowflake, name: &str) -> Result<Channel> {
+        self.call(Method::POST, &format!("/channels/{channel}/messages/{message}/threads"), Some(&CreateThreadRequest { name: name.into() })).await
+    }
+
+    // ---------------------------------------------------------------- администратор
+
+    pub async fn admin_users(&self) -> Result<Vec<AdminUser>> {
+        self.call::<(), _>(Method::GET, "/admin/users", None).await
+    }
+
+    pub async fn admin_delete_user(&self, user: Snowflake) -> Result<()> {
+        self.call::<(), ()>(Method::DELETE, &format!("/admin/users/{user}"), None).await
+    }
+
+    pub async fn admin_reset_password(&self, user: Snowflake) -> Result<TempPassword> {
+        self.call::<(), _>(Method::POST, &format!("/admin/users/{user}/password-reset"), None).await
+    }
+
+    pub async fn admin_settings(&self) -> Result<AdminSettings> {
+        self.call::<(), _>(Method::GET, "/admin/settings", None).await
+    }
+
+    pub async fn admin_set_registration(&self, mode: RegistrationMode) -> Result<AdminSettings> {
+        self.call(Method::PUT, "/admin/settings", Some(&AdminSettings { registration: mode })).await
+    }
+
+    async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let mut req = self.http.get(format!("{}/api/v1{path}", self.base));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api { status: status.as_u16(), code: "http".into(), message: format!("недоступно ({status})") });
+        }
+        Ok(resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?.to_vec())
     }
 
     /// Загрузить файл в канал (до отправки сообщения)

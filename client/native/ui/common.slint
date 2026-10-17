@@ -1,0 +1,232 @@
+// Общее для главного окна и диалогов: тема, аватар, иконки, поля, структуры строк списков.
+
+import { Switch } from "std-widgets.slint";
+
+export global Theme {
+    out property <color> bg0: #111214;
+    out property <color> bg1: #1a1b1e;
+    out property <color> bg2: #222327;
+    out property <color> hover: #2b2d31;
+    out property <color> active: #34363c;
+    out property <color> row-hover: #26272b;
+    out property <color> text: #dcdee1;
+    out property <color> dim: #8e9297;
+    out property <color> accent: #6c8cff;
+    out property <color> border: #2a2b2f;
+    out property <color> danger: #f07178;
+    out property <color> ok: #3ba55c;
+    out property <color> warn: #faa61a;
+}
+
+/// Строка универсального списка: результаты поиска, закреплённые, журнал, баны, пользователи
+export struct ListRow {
+    title: string,
+    subtitle: string,
+    text: string,
+    initial: string,
+    tint: color,
+    avatar: image,
+    has-avatar: bool,
+    /// Подписи кнопок справа; "" — кнопки нет
+    action: string,
+    action2: string,
+}
+
+/// Роль в настройках канала: видит ли канал и может ли писать
+export struct RoleToggle {
+    name: string,
+    tint: color,
+    view: bool,
+    send: bool,
+}
+
+/// Подсказка @упоминания
+export struct MentionItem {
+    name: string,
+    initial: string,
+    tint: color,
+    avatar: image,
+    has-avatar: bool,
+}
+
+export component Avatar inherits Rectangle {
+    in property <string> initial;
+    in property <color> tint;
+    in property <image> image;
+    in property <bool> has-image;
+    in property <length> size: 40px;
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: has-image ? transparent : tint;
+    clip: true;
+    if !has-image: Text {
+        width: parent.width;
+        height: parent.height;
+        text: initial;
+        color: #111;
+        font-weight: 700;
+        font-size: size * 0.38;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if has-image: Image {
+        width: parent.width;
+        height: parent.height;
+        source: image;
+        image-fit: cover;
+    }
+}
+
+export component Icon inherits Path {
+    width: 16px;
+    height: 16px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+}
+
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> on;
+    in property <color> on-color: Theme.accent;
+    callback clicked();
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: ita.has-hover ? Theme.hover : transparent;
+    ita := TouchArea { clicked => { root.clicked(); } }
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        commands: icon;
+        fill: on ? on-color : ita.has-hover ? Theme.text : Theme.dim;
+    }
+}
+
+export component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text {
+        text: label;
+        color: Theme.dim;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    @children
+}
+
+export component SettingRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled();
+    spacing: 12px;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text { text: title; color: Theme.text; }
+        if hint != "": Text {
+            text: hint;
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        Switch {
+            checked <=> root.checked;
+            enabled: root.enabled;
+            toggled => { root.toggled(); }
+        }
+    }
+}
+
+/// Затемнение под диалогом: перехватывает клики, чтобы они не уходили в окно под ним
+export component Backdrop inherits Rectangle {
+    background: #000000a8;
+    TouchArea { }
+}
+
+/// Простая панель вкладок
+export component Tabs inherits HorizontalLayout {
+    in property <[string]> labels;
+    in-out property <int> current;
+    spacing: 4px;
+    alignment: start;
+    for l[i] in labels: tta := TouchArea {
+        width: tt.preferred-width + 24px;
+        height: 32px;
+        clicked => { root.current = i; }
+        Rectangle {
+            border-radius: 6px;
+            background: i == current ? Theme.active : tta.has-hover ? Theme.hover : transparent;
+        }
+        tt := Text {
+            text: l;
+            color: i == current ? Theme.text : Theme.dim;
+            font-weight: i == current ? 600 : 400;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// Кнопка-ссылка (текст без рамки)
+export component LinkButton inherits TouchArea {
+    in property <string> text;
+    in property <color> color: Theme.accent;
+    in property <length> font-size: 13px;
+    mouse-cursor: pointer;
+    width: lt.preferred-width;
+    height: lt.preferred-height + 4px;
+    lt := Text {
+        text: root.text;
+        color: root.has-hover ? Theme.text : root.color;
+        font-size: root.font-size;
+        vertical-alignment: center;
+    }
+}
+
+/// Строка универсального списка с кнопками справа
+export component ListRowView inherits TouchArea {
+    in property <ListRow> item;
+    in property <bool> clickable;
+    callback action();
+    callback action2();
+    mouse-cursor: clickable ? pointer : default;
+    height: max(48px, body.preferred-height + 12px);
+    Rectangle {
+        border-radius: 6px;
+        background: root.has-hover ? Theme.hover : transparent;
+    }
+    body := HorizontalLayout {
+        padding: 6px;
+        padding-left: 8px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: start;
+            Avatar { size: 32px; initial: item.initial; tint: item.tint; image: item.avatar; has-image: item.has-avatar; }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: 8px;
+                Text { text: item.title; color: item.tint; font-weight: 600; overflow: elide; horizontal-stretch: 0; }
+                Text { text: item.subtitle; color: Theme.dim; font-size: 12px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+            }
+            if item.text != "": Text { text: item.text; color: Theme.text; wrap: word-wrap; font-size: 14px; }
+        }
+        if item.action != "": VerticalLayout {
+            alignment: center;
+            LinkButton { text: item.action; clicked => { root.action(); } }
+        }
+        if item.action2 != "": VerticalLayout {
+            alignment: center;
+            LinkButton { text: item.action2; color: Theme.danger; clicked => { root.action2(); } }
+        }
+    }
+}

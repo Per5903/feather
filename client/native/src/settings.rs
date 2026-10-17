@@ -19,6 +19,12 @@ pub struct Settings {
     pub notifications: bool,
     /// Клавиша push-to-talk (Windows: «Ctrl+Alt+V», «Mouse4»; на Linux её назначает KDE)
     pub ptt_key: Option<String>,
+    /// Звук, когда кто-то заходит в голосовой канал или выходит
+    pub voice_sounds: bool,
+    /// Проверять новую версию на GitHub при запуске
+    pub check_updates: bool,
+    /// Громкость собеседников: id пользователя → множитель (1.0 — как есть)
+    pub volumes: std::collections::HashMap<String, f32>,
 }
 
 impl Default for Settings {
@@ -32,6 +38,9 @@ impl Default for Settings {
             economy_mode: false,
             notifications: true,
             ptt_key: None,
+            voice_sounds: true,
+            check_updates: true,
+            volumes: Default::default(),
         }
     }
 }

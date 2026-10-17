@@ -11,3 +11,5 @@ tokio = { version = "1", features = ["full"] }
 # Явный криптобэкенд TLS для wss:// (см. client/core/src/tls.rs)
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 futures-util = "0.3"
+# Замер jitter: отправитель — настоящий голосовой тракт клиента
+feather-core = { path = "../core" }

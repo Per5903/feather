@@ -1,6 +1,6 @@
 [package]
 name = "feather-native"
-version = "0.0.1"
+version = "0.2.0"
 edition = "2024"
 publish = false
 
@@ -26,6 +26,8 @@ slint = { version = "1.18", default-features = false, features = [
     "accessibility",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# QR-код для настройки двухфакторной защиты
+qrcode = { version = "0.14", default-features = false }
 # Только для снимков окна в режиме FEATHER_SNAPSHOT (проверки и скриншоты)
 png = "0.18"
 

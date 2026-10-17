@@ -9,15 +9,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
+use feather_core::voice::Cue;
 use feather_core::{Api, GatewayEvent, GatewayHandle, HotkeyEvent, HotkeyHandle, Notifier, VoiceEvent, VoiceOptions, VoiceSession};
-use feather_protocol::{Attachment, Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, Role, RoleRequest, Snowflake, User, VoiceState, perms};
+use feather_protocol::{
+    AdminUser, Attachment, Channel, ChannelKind as Kind, ClientOp, DmChannel, Event, Guild, GuildMember, Message, OverwriteKind, Reaction, Role,
+    RoleRequest, SendMessageRequest, Snowflake, User, VoiceState, perms,
+};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::session::{self, Session};
 use crate::settings::{self, Settings};
 use crate::util::{color, initial, time_label, user_color};
-use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, Member, Msg, PermItem, RoleItem, VoiceMember};
+use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, ListRow, Member, MentionItem, Msg, PermItem, ReactionChip, RoleItem, RoleToggle, VoiceMember};
+
+mod account;
+mod extras;
+mod manage;
+pub mod render;
+
+/// Страница релизов: куда ведёт «Вышла новая версия»
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Пусто: адрес Feather каждому сообщает тот, кто зовёт (в поле — пример)
 const DEFAULT_SERVER: &str = "";
@@ -125,6 +137,7 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
     let Some(ui) = weak.upgrade() else { return };
     let (server, name, password) = (ui.get_server_url().to_string(), ui.get_login_name().to_string(), ui.get_login_password().to_string());
     let invite = ui.get_login_invite().trim().to_owned();
+    let totp = ui.get_login_totp().trim().to_owned();
     if server.trim().is_empty() {
         ui.set_login_error("Введите адрес Feather — его даёт владелец сервера".into());
         return;
@@ -152,7 +165,7 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
             if register {
                 api.register(name.trim(), &password, (!invite.is_empty()).then_some(invite.as_str())).await?;
             }
-            api.login(name.trim(), &password, &device_name()).await
+            api.login(name.trim(), &password, &device_name(), (!totp.is_empty()).then_some(totp.as_str())).await
         }
         .await;
         post_ui(weak, move |ui| {
@@ -162,6 +175,8 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
                     ui.set_login_password(SharedString::new());
                     ui.set_login_password2(SharedString::new());
                     ui.set_login_invite(SharedString::new());
+                    ui.set_login_totp(SharedString::new());
+                    ui.set_login_need_totp(false);
                     ui.set_register_mode(false);
                     let api = api.with_token(resp.token.clone());
                     let prev = session::load().filter(|s| s.server == api.base() && s.username == resp.user.username);
@@ -173,7 +188,13 @@ fn login(weak: Weak<AppWindow>, rt: Handle, register: bool) {
                     });
                     App::start(ui, rt2, api, resp.user);
                 }
-                Err(e) => ui.set_login_error(e.to_string().into()),
+                Err(e) => {
+                    // Пароль верный, нужен второй фактор: показываем поле кода
+                    if e.code() == Some("totp_required") {
+                        ui.set_login_need_totp(true);
+                    }
+                    ui.set_login_error(e.to_string().into());
+                }
             }
         });
     });
@@ -230,6 +251,64 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_member_roles(|i| post(move |app| app.open_member_roles(i as usize)));
     ui.on_save_member_roles(|| post(|app| app.save_member_roles()));
 
+    ui.on_ban_member(|i| post(move |app| app.ask_ban(i as usize)));
+    ui.on_reply_message(|i| post(move |app| app.start_reply(i as usize)));
+    ui.on_cancel_reply(|| post(|app| app.cancel_reply()));
+    ui.on_react_message(|i| post(move |app| app.open_reaction_picker(i as usize)));
+    ui.on_toggle_reaction(|i, e| post(move |app| app.toggle_reaction(i as usize, e.to_string())));
+    ui.on_emoji_picked(|e| post(move |app| app.emoji_picked(e.to_string())));
+    ui.on_pin_message(|i| post(move |app| app.toggle_pin(i as usize)));
+    ui.on_thread_message(|i| post(move |app| app.ask_thread(i as usize)));
+    ui.on_open_thread(|i| post(move |app| app.open_thread(i as usize)));
+    ui.on_copy_message(|i| post(move |app| app.copy_message(i as usize)));
+    ui.on_open_link(|url| {
+        feather_core::files::open_url(&url);
+    });
+    ui.on_open_embed(|i| post(move |app| app.open_embed(i as usize)));
+    ui.on_composer_changed(|t| post(move |app| app.composer_changed(t.to_string())));
+    ui.on_pick_mention(|i| post(move |app| app.pick_mention(i as usize)));
+    ui.on_paste_image(|| {
+        // Синхронно: решаем, перехватывать ли Ctrl+V. Картинку читаем сразу (буфер меняется)
+        match feather_core::files::clipboard_image_png() {
+            Some(png) => {
+                post(move |app| app.attach_bytes("скриншот.png".into(), png, "image/png"));
+                true
+            }
+            None => false,
+        }
+    });
+    ui.on_open_pins(|| post(|app| app.open_pins()));
+    ui.on_open_search(|| post(|app| app.open_search()));
+    ui.on_list_search(|| post(|app| app.run_search()));
+    ui.on_list_open(|i| post(move |app| app.list_open(i as usize)));
+    ui.on_list_action(|i| post(move |app| app.list_action(i as usize)));
+    ui.on_voice_member(|id| post(move |app| app.open_volume(id.to_string())));
+    ui.on_volume_changed(|v| post(move |app| app.volume_changed(v)));
+    ui.on_open_update(|| post(|app| app.open_update()));
+    ui.on_channel_settings(|i| post(move |app| app.open_channel_settings(i as usize)));
+    ui.on_ch_save(|| post(|app| app.save_channel_settings()));
+    ui.on_ch_delete(|| post(|app| app.delete_channel()));
+    ui.on_open_guild_settings(|| post(|app| app.open_guild_settings()));
+    ui.on_guild_tab_changed(|i| post(move |app| app.guild_tab_changed(i as usize)));
+    ui.on_guild_save_name(|| post(|app| app.guild_save_name()));
+    ui.on_guild_transfer(|| post(|app| app.guild_transfer()));
+    ui.on_guild_delete(|| post(|app| app.guild_delete()));
+    ui.on_guild_leave(|| post(|app| app.guild_leave()));
+    ui.on_guild_unban(|i| post(move |app| app.guild_unban(i as usize)));
+    ui.on_open_account(|| post(|app| app.open_account()));
+    ui.on_account_save_profile(|| post(|app| app.account_save_profile()));
+    ui.on_account_pick_avatar(|| post(|app| app.account_pick_avatar()));
+    ui.on_account_remove_avatar(|| post(|app| app.account_remove_avatar()));
+    ui.on_account_change_password(|| post(|app| app.account_change_password()));
+    ui.on_account_start_totp(|| post(|app| app.account_start_totp()));
+    ui.on_account_enable_totp(|| post(|app| app.account_enable_totp()));
+    ui.on_account_disable_totp(|| post(|app| app.account_disable_totp()));
+    ui.on_account_delete(|| post(|app| app.account_delete()));
+    ui.on_open_admin(|| post(|app| app.open_admin()));
+    ui.on_admin_set_registration(|i| post(move |app| app.admin_set_registration(i)));
+    ui.on_admin_reset_password(|i| post(move |app| app.admin_reset_password(i as usize)));
+    ui.on_admin_delete_user(|i| post(move |app| app.admin_ask_delete(i as usize)));
+
     let weak = ui.as_weak();
     ui.on_create_guild_dialog(move || open_dialog(&weak, "create"));
     let weak = ui.as_weak();
@@ -247,10 +326,24 @@ fn open_dialog(weak: &Weak<AppWindow>, kind: &str) {
 /// Порядок как в Discord: каналы без категории, затем категории со своими каналами
 fn ordered(mut cs: Vec<Channel>) -> Vec<Channel> {
     cs.sort_by_key(|c| (c.position, c.id));
-    let mut out: Vec<Channel> = cs.iter().filter(|c| c.parent_id.is_none() && c.kind != Kind::Category).cloned().collect();
+    // Ветки — сразу под своим каналом, новые сверху
+    let with_threads = |c: &Channel, out: &mut Vec<Channel>| {
+        out.push(c.clone());
+        let mut threads: Vec<&Channel> = cs.iter().filter(|t| t.kind == Kind::Thread && t.parent_id == Some(c.id)).collect();
+        threads.sort_by_key(|t| std::cmp::Reverse(t.id));
+        out.extend(threads.into_iter().cloned());
+    };
+    let mut out = Vec::new();
+    // Без категории — и те, чья категория мне не видна (закрыта, а сам канал открыт)
+    let orphan = |c: &Channel| c.parent_id.is_none_or(|p| !cs.iter().any(|x| x.id == p));
+    for c in cs.iter().filter(|c| orphan(c) && !matches!(c.kind, Kind::Category | Kind::Thread)) {
+        with_threads(c, &mut out);
+    }
     for cat in cs.iter().filter(|c| c.kind == Kind::Category) {
         out.push(cat.clone());
-        out.extend(cs.iter().filter(|c| c.parent_id == Some(cat.id)).cloned());
+        for c in cs.iter().filter(|c| c.parent_id == Some(cat.id) && c.kind != Kind::Thread) {
+            with_threads(c, &mut out);
+        }
     }
     out
 }
@@ -258,7 +351,7 @@ fn ordered(mut cs: Vec<Channel>) -> Vec<Channel> {
 fn msg_row(prev: Option<&Message>, m: &Message, me: Snowflake, moderator: bool) -> Msg {
     let ts = m.id.timestamp_ms();
     let head = prev.is_none_or(|p| p.author.id != m.author.id || ts.saturating_sub(p.id.timestamp_ms()) > GROUP_GAP_MS);
-    let name = m.author.display_name.as_deref().unwrap_or(&m.author.username);
+    let name = m.author.shown_name();
     Msg {
         head,
         author: name.into(),
@@ -270,16 +363,43 @@ fn msg_row(prev: Option<&Message>, m: &Message, me: Snowflake, moderator: bool) 
         own: m.author.id == me,
         can_delete: m.author.id == me || moderator,
         mention: false,
+        pinned: m.pinned,
         ..Default::default()
     }
 }
 
 /// Упомянут ли пользователь в тексте: «@имя» без учёта регистра, целым словом
 fn mentions(text: &str, username: &str) -> bool {
-    let (text, needle) = (text.to_lowercase(), format!("@{}", username.to_lowercase()));
-    text.match_indices(&needle).any(|(i, _)| {
-        text[i + needle.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-'))
-    })
+    render::contains_mention(text, username)
+}
+
+/// Реакции сообщения: поставить/убрать (для событий шлюза и мгновенного отклика)
+fn apply_reaction(m: &mut Message, emoji: &str, mine: bool, add: bool) {
+    match m.reactions.iter_mut().position(|r| r.emoji == emoji) {
+        Some(i) => {
+            let r = &mut m.reactions[i];
+            if add {
+                if mine && r.me {
+                    return;
+                }
+                r.count += 1;
+                r.me |= mine;
+            } else {
+                if mine && !r.me {
+                    return;
+                }
+                r.count = r.count.saturating_sub(1);
+                if mine {
+                    r.me = false;
+                }
+                if r.count == 0 {
+                    m.reactions.remove(i);
+                }
+            }
+        }
+        None if add => m.reactions.push(Reaction { emoji: emoji.to_owned(), count: 1, me: mine }),
+        None => {}
+    }
 }
 
 /// Первая картинка с превью среди вложений
@@ -348,6 +468,7 @@ fn voice_options(s: &Settings) -> VoiceOptions {
         output_device: std::env::var("FEATHER_SPEAKER").ok().or_else(|| s.output_device.clone()),
         // В режиме PTT решает клавиша; FEATHER_NO_VAD — выключить для замеров
         voice_activation: !s.push_to_talk && std::env::var_os("FEATHER_NO_VAD").is_none(),
+        volumes: s.volumes.clone(),
     }
 }
 
@@ -366,6 +487,8 @@ const PERM_LIST: &[(u64, &str, &str)] = &[
     (perms::SEND_MESSAGES, "Писать сообщения", "В текстовых каналах"),
     (perms::VOICE_CONNECT, "Заходить в голосовые", "Слушать голосовые каналы"),
     (perms::VOICE_SPEAK, "Говорить", "Включать микрофон в голосовых каналах"),
+    (perms::VIEW_CHANNEL, "Видеть каналы", "Без этого права видны только каналы, открытые роли отдельно"),
+    (perms::MANAGE_GUILD, "Управлять сообществом", "Переименовывать сообщество, читать журнал модерации"),
 ];
 
 /// После отпускания push-to-talk звук идёт ещё столько: не обрезаем последний слог
@@ -435,15 +558,47 @@ struct App {
     typing_timer: Timer,
     /// Списки устройств, показанные в настройках (индексы ComboBox → имена)
     device_lists: (Vec<String>, Vec<String>),
+    /// Я администратор сервера Feather
+    admin: bool,
+    /// Аватары: пользователь → (версия, картинка); что сейчас грузится
+    avatars: HashMap<Snowflake, (Snowflake, slint::Image)>,
+    avatars_loading: HashSet<(Snowflake, Snowflake)>,
+    /// Отвечаем на это сообщение
+    reply_to: Option<Snowflake>,
+    /// Эмодзи из панели пойдёт реакцией на это сообщение (None — в поле ввода)
+    reacting_to: Option<Snowflake>,
+    /// Из этого сообщения создаётся ветка
+    pending_thread: Option<Snowflake>,
+    pending_ban: Option<Snowflake>,
+    /// Настройки канала: какой канал и какие роли показаны в окне
+    settings_channel: Option<Snowflake>,
+    settings_roles: Vec<Snowflake>,
+    /// Окно громкости: чья
+    volume_target: Option<Snowflake>,
+    /// Окно-список (поиск или закреплённые) и сообщения в нём
+    list_kind: extras::ListKind,
+    list_messages: Vec<Message>,
+    /// Настройки сообщества: вкладки, кандидаты в новые владельцы, забаненные
+    guild_tabs: Vec<manage::GuildTab>,
+    owner_candidates: Vec<User>,
+    bans: Vec<User>,
+    /// Панель администратора
+    admin_users: Vec<AdminUser>,
+    pending_user_delete: Option<Snowflake>,
+    /// Подсказки @упоминаний: кого предлагаем
+    mention_candidates: Vec<User>,
+    /// Страница новой версии
+    update_url: Option<String>,
 }
 
 impl App {
     fn start(ui: &AppWindow, rt: Handle, api: Api, me: User) {
         let model = Rc::new(VecModel::<Msg>::default());
         ui.set_messages(ModelRc::from(model.clone()));
-        ui.set_me_name(me.username.as_str().into());
-        ui.set_me_initial(initial(&me.username));
+        ui.set_me_name(me.shown_name().into());
+        ui.set_me_initial(initial(me.shown_name()));
         ui.set_me_tint(user_color(me.id));
+        ui.set_me_has_avatar(false);
         ui.set_status(SharedString::new());
         ui.set_logged_in(true);
 
@@ -499,6 +654,25 @@ impl App {
             last_typing_sent: None,
             typing_timer: Timer::default(),
             device_lists: (Vec::new(), Vec::new()),
+            admin: false,
+            avatars: HashMap::new(),
+            avatars_loading: HashSet::new(),
+            reply_to: None,
+            reacting_to: None,
+            pending_thread: None,
+            pending_ban: None,
+            settings_channel: None,
+            settings_roles: Vec::new(),
+            volume_target: None,
+            list_kind: extras::ListKind::None,
+            list_messages: Vec::new(),
+            guild_tabs: Vec::new(),
+            owner_candidates: Vec::new(),
+            bans: Vec::new(),
+            admin_users: Vec::new(),
+            pending_user_delete: None,
+            mention_candidates: Vec::new(),
+            update_url: None,
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
         APP.with_borrow_mut(|slot| {
@@ -508,9 +682,14 @@ impl App {
                     Some(Notifier::spawn(APP_ID))
                 };
                 app.update_hotkey();
+                app.refresh_me();
+                app.check_update();
                 // Для снимков интерфейса в автотестах
                 if std::env::var_os("FEATHER_OPEN_SETTINGS").is_some() {
                     app.open_settings();
+                }
+                if std::env::var_os("FEATHER_OPEN_ACCOUNT").is_some() {
+                    app.open_account();
                 }
             }
         });
@@ -572,18 +751,55 @@ impl App {
                     Kind::Voice => ChannelKind::Voice,
                     Kind::Category => ChannelKind::Category,
                     Kind::Dm => ChannelKind::Dm,
+                    Kind::Thread => ChannelKind::Thread,
                 },
                 active: Some(c.id) == self.channel || self.voice.as_ref().is_some_and(|v| v.channel == c.id),
                 unread: self.unread.contains_key(&c.id),
                 voice_members: self.voice_members(c.id),
-                // Создавать каналы пока может владелец сервера (роли — следующий шаг)
                 can_add: c.kind == Kind::Category && self.can(perms::MANAGE_CHANNELS),
+                can_manage: c.kind != Kind::Dm && self.can(perms::MANAGE_CHANNELS),
+                private: Self::is_private(c),
             })
             .collect();
         ui.set_channels(ModelRc::new(VecModel::from(items)));
         let current = self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id));
         ui.set_channel_name(current.map(|c| c.name.clone()).unwrap_or_default().into());
-        ui.set_can_write(current.is_some_and(|c| matches!(c.kind, Kind::Text | Kind::Dm)));
+        ui.set_in_thread(current.is_some_and(|c| c.kind == Kind::Thread));
+        ui.set_can_write(current.is_some_and(|c| matches!(c.kind, Kind::Text | Kind::Dm | Kind::Thread)) && self.can_send_here());
+    }
+
+    /// Закрытый канал: @everyone не видит
+    fn is_private(c: &Channel) -> bool {
+        c.overwrites.iter().any(|o| o.kind == OverwriteKind::Role && o.id == c.guild_id && o.deny & perms::VIEW_CHANNEL != 0)
+    }
+
+    /// Мои права в канале с учётом его настроек (как считает сервер)
+    fn channel_perms(&self, c: &Channel) -> u64 {
+        let base = self.my_perms();
+        let source = if c.kind == Kind::Thread { c.parent_id.and_then(|p| self.channels.iter().find(|x| x.id == p)).unwrap_or(c) } else { c };
+        let mine = self.member_roles.get(&self.me.id);
+        let (mut everyone, mut member, mut roles) = (None, None, (0u64, 0u64));
+        for o in &source.overwrites {
+            match o.kind {
+                OverwriteKind::Member if o.id == self.me.id => member = Some((o.allow, o.deny)),
+                OverwriteKind::Role if o.id == c.guild_id => everyone = Some((o.allow, o.deny)),
+                OverwriteKind::Role if mine.is_some_and(|m| m.contains(&o.id)) => {
+                    roles.0 |= o.allow;
+                    roles.1 |= o.deny;
+                }
+                _ => {}
+            }
+        }
+        perms::apply_overwrites(base, everyone, roles, member)
+    }
+
+    /// В открытый канал можно писать (в личке — всегда)
+    fn can_send_here(&self) -> bool {
+        if self.dm_mode {
+            return true;
+        }
+        let Some(c) = self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id)) else { return false };
+        self.channel_perms(c) & perms::SEND_MESSAGES != 0
     }
 
     fn voice_members(&self, channel: Snowflake) -> ModelRc<VoiceMember> {
@@ -597,13 +813,19 @@ impl App {
         let rows: Vec<VoiceMember> = states
             .into_iter()
             .map(|v| {
-                let name = v.user.display_name.as_deref().unwrap_or(&v.user.username);
+                let name = v.user.shown_name();
+                let (avatar, has_avatar) = self.avatar_of(&v.user);
                 VoiceMember {
+                    id: v.user.id.to_string().into(),
                     name: name.into(),
                     initial: initial(name),
                     tint: user_color(v.user.id),
+                    avatar,
+                    has_avatar,
                     speaking: speaking.is_some_and(|s| s.contains(&v.user.id.to_string())),
                     muted: v.muted || v.deafened,
+                    me: v.user.id == self.me.id,
+                    volume_changed: self.settings.volumes.get(&v.user.id.to_string()).is_some_and(|g| (*g - 1.0).abs() > 0.01),
                 }
             })
             .collect();
@@ -669,19 +891,27 @@ impl App {
         let mut ms: Vec<User> = self.members.clone();
         // Старшие роли выше, внутри — по имени
         ms.sort_by_key(|u| (std::cmp::Reverse(self.top_position(u.id)), u.username.to_lowercase()));
-        let (can_kick, my_top) = (self.can(perms::KICK_MEMBERS), self.top_position(self.me.id));
+        let (can_kick, can_ban, my_top) = (self.can(perms::KICK_MEMBERS), self.can(perms::BAN_MEMBERS), self.top_position(self.me.id));
         let can_roles = !self.dm_mode && self.can(perms::MANAGE_ROLES);
         let items: Vec<Member> = ms
             .iter()
-            .map(|u| Member {
-                name: u.username.as_str().into(),
-                initial: initial(&u.username),
-                tint: self.user_tint(u.id),
-                can_message: u.id != self.me.id,
-                can_kick: can_kick && u.id != self.me.id && my_top > self.top_position(u.id),
-                can_roles: can_roles && (u.id == self.me.id || my_top > self.top_position(u.id)),
+            .map(|u| {
+                let (avatar, has_avatar) = self.avatar_of(u);
+                let below = u.id != self.me.id && my_top > self.top_position(u.id);
+                Member {
+                    name: u.shown_name().into(),
+                    initial: initial(u.shown_name()),
+                    tint: self.user_tint(u.id),
+                    avatar,
+                    has_avatar,
+                    can_message: u.id != self.me.id,
+                    can_kick: !self.dm_mode && can_kick && below,
+                    can_ban: !self.dm_mode && can_ban && below,
+                    can_roles: can_roles && (u.id == self.me.id || my_top > self.top_position(u.id)),
+                }
             })
             .collect();
+        self.request_avatars(ms.iter());
         self.members_view = ms;
         ui.set_members(ModelRc::new(VecModel::from(items)));
     }
@@ -690,8 +920,8 @@ impl App {
 
     /// Личный канал как элемент списка каналов (имя — собеседники)
     fn dm_as_channel(d: &DmChannel) -> Channel {
-        let name = d.recipients.iter().map(|u| u.display_name.clone().unwrap_or(u.username.clone())).collect::<Vec<_>>().join(", ");
-        Channel { id: d.id, guild_id: Snowflake(0), kind: Kind::Dm, name, parent_id: None, position: 0 }
+        let name = d.recipients.iter().map(|u| u.shown_name().to_owned()).collect::<Vec<_>>().join(", ");
+        Channel { id: d.id, guild_id: Snowflake(0), kind: Kind::Dm, name, parent_id: None, position: 0, overwrites: Vec::new() }
     }
 
     /// Свежие диалоги сверху
@@ -811,9 +1041,45 @@ impl App {
             .map(|a| format!("{} · {}", a.filename, feather_core::files::human_size(a.size)))
             .collect::<Vec<_>>()
             .join("\n");
+        let (avatar, has_avatar) = self.avatar_of(&m.author);
+        // Разметка: только если в тексте есть что размечать (обычный Text лучше переносит строки)
+        let names = self.mention_palette();
+        let plain_names: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+        let rich = render::needs_markup(&m.content, &plain_names);
+        let body = if rich {
+            slint::StyledText::from_markdown(&render::markup(&m.content, &names, m.edited_at.is_some())).ok()
+        } else {
+            None
+        };
+        let reply = m.reply_to_id.map(|r| match self.messages.iter().find(|x| x.id == r) {
+            Some(orig) => (orig.author.shown_name().to_owned(), self.user_tint(orig.author.id), render::snippet(&orig.content, 120)),
+            None => ("Сообщение".to_owned(), slint::Color::from_rgb_u8(0x8e, 0x92, 0x97), "не загружено или удалено".to_owned()),
+        });
+        let in_guild_text = !self.dm_mode && self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id)).is_some_and(|c| c.kind == Kind::Text);
+        let embed = m.embeds.first();
         Msg {
             mention: m.author.id != self.me.id && mentions(&m.content, &self.me.username),
             tint: self.user_tint(m.author.id),
+            avatar,
+            has_avatar,
+            rich: body.is_some(),
+            body: body.unwrap_or_default(),
+            reply_author: reply.as_ref().map(|r| r.0.as_str()).unwrap_or_default().into(),
+            reply_tint: reply.as_ref().map(|r| r.1).unwrap_or_default(),
+            reply_text: reply.as_ref().map(|r| r.2.as_str()).unwrap_or_default().into(),
+            can_pin: self.dm_mode || self.moderator(),
+            can_thread: in_guild_text && m.thread_id.is_none() && self.can_send_here(),
+            thread_name: m
+                .thread_id
+                .map(|t| self.channels.iter().find(|c| c.id == t).map(|c| c.name.clone()).unwrap_or_else(|| "ветка".into()))
+                .unwrap_or_default()
+                .into(),
+            reactions: ModelRc::new(VecModel::from(
+                m.reactions.iter().map(|r| ReactionChip { emoji: r.emoji.as_str().into(), count: r.count as i32, me: r.me }).collect::<Vec<_>>(),
+            )),
+            embed_site: embed.and_then(|e| e.site_name.as_deref()).unwrap_or_default().into(),
+            embed_title: embed.and_then(|e| e.title.as_deref()).unwrap_or_default().into(),
+            embed_desc: embed.and_then(|e| e.description.as_deref()).unwrap_or_default().into(),
             has_image: img.is_some(),
             img_w,
             img_h,
@@ -831,7 +1097,7 @@ impl App {
         if !self.settings.notifications || m.author.id == self.me.id || Some(m.channel_id) == self.channel {
             return;
         }
-        let author = m.author.display_name.as_deref().unwrap_or(&m.author.username);
+        let author = m.author.shown_name();
         let title = if dm {
             author.to_owned()
         } else if mentions(&m.content, &self.me.username) {
@@ -849,6 +1115,15 @@ impl App {
         let rows: Vec<Msg> = (0..self.messages.len()).map(|i| self.row_at(i)).collect();
         self.model.set_vec(rows);
         self.request_thumbs();
+        let authors: Vec<User> = self.messages.iter().map(|m| m.author.clone()).collect();
+        self.request_avatars(authors.iter());
+    }
+
+    /// Перерисовать одно сообщение по id
+    fn refresh_message(&mut self, id: Snowflake) {
+        if let Some(i) = self.messages.iter().position(|m| m.id == id) {
+            self.model.set_row_data(i, self.row_at(i));
+        }
     }
 
     /// Догрузить превью картинок, которых ещё нет в кэше
@@ -1001,7 +1276,7 @@ impl App {
     fn scroll_to_bottom_later(&self) {
         // ListView узнаёт настоящие высоты строк (картинки, перенос текста) только после
         // отрисовки, поэтому прокручиваем дважды: сразу после кадра и после уточнения высот
-        for delay in [20, 150] {
+        for delay in [20, 150, 450] {
             let weak = self.ui.clone();
             Timer::single_shot(Duration::from_millis(delay), move || {
                 if let Some(ui) = weak.upgrade() {
@@ -1078,12 +1353,14 @@ impl App {
                 self.join_voice(c);
                 return;
             }
-            Kind::Text | Kind::Dm => {}
+            Kind::Text | Kind::Dm | Kind::Thread => {}
         }
         self.set_status("");
         self.typing.clear();
         self.refresh_typing();
         self.cancel_edit();
+        self.cancel_reply();
+        self.close_emoji();
         self.pending_files.clear();
         self.refresh_pending();
         self.channel = Some(c.id);
@@ -1228,6 +1505,8 @@ impl App {
     }
 
     fn start_edit(&mut self, i: usize) {
+        // usize::MAX (из -1) — последнее своё сообщение: стрелка вверх в пустом поле
+        let i = if i == usize::MAX { self.messages.iter().rposition(|m| m.author.id == self.me.id).unwrap_or(usize::MAX) } else { i };
         let Some(m) = self.messages.get(i).filter(|m| m.author.id == self.me.id) else { return };
         self.editing = Some(m.id);
         if let Some(ui) = self.ui() {
@@ -1516,9 +1795,14 @@ impl App {
         let ids: Vec<Snowflake> = self.pending_files.drain(..).filter_map(|f| f.attachment.map(|a| a.id)).collect();
         self.refresh_pending();
         let nonce = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        let req = SendMessageRequest { content: text, reply_to_id: self.reply_to.take(), nonce: Some(nonce), attachment_ids: ids };
+        self.cancel_reply();
+        self.close_emoji();
+        self.mention_candidates.clear();
+        self.refresh_mentions();
         let api = self.api.clone();
         self.rt.spawn(async move {
-            let res = api.send_with_attachments(channel, &text, nonce, ids).await;
+            let res = api.send_full(channel, &req).await;
             post(move |app| match res {
                 // Ответ сервера добавляем сразу: не ждём шлюз (и работаем, даже если он переподключается)
                 Ok(m) if app.channel == Some(m.channel_id) => app.add_message(m),
@@ -1532,8 +1816,10 @@ impl App {
 
     fn on_gateway(&mut self, ev: GatewayEvent) {
         match ev {
-            GatewayEvent::Ready { user, guilds, unread, voice_states } => {
+            GatewayEvent::Ready { user, guilds, unread, voice_states, admin } => {
                 self.me = user;
+                self.admin = admin;
+                self.refresh_me();
                 self.guilds = guilds;
                 self.voice_states = voice_states.into_iter().filter(|v| v.channel_id.is_some()).map(|v| (v.user.id, v)).collect();
                 // Переподключение шлюза: сервер забыл наше голосовое состояние вместе со старой сессией
@@ -1746,7 +2032,18 @@ impl App {
                 }
             }
             Event::VoiceStateUpdate(v) => {
+                // Звук «зашёл / вышел» — только про мой голосовой канал и не про меня
+                if let Some(mine) = self.voice.as_ref().filter(|_| v.user.id != self.me.id).map(|x| x.channel) {
+                    let was = self.voice_states.get(&v.user.id).and_then(|s| s.channel_id) == Some(mine);
+                    let now = v.channel_id == Some(mine);
+                    if now && !was {
+                        self.cue(Cue::Join);
+                    } else if was && !now {
+                        self.cue(Cue::Leave);
+                    }
+                }
                 if v.channel_id.is_some() {
+                    self.request_avatars(std::iter::once(&v.user));
                     self.voice_states.insert(v.user.id, v);
                 } else {
                     self.voice_states.remove(&v.user.id);
@@ -1758,6 +2055,62 @@ impl App {
                 if self.unread.remove(&channel_id).is_some() {
                     self.refresh_guilds();
                     self.refresh_channels();
+                }
+            }
+            Event::ChannelUpdate(c) => {
+                if Some(c.guild_id) == self.guild {
+                    let mut all: Vec<Channel> = std::mem::take(&mut self.channels).into_iter().filter(|x| x.id != c.id).collect();
+                    all.push(c);
+                    self.channels = ordered(all);
+                    self.refresh_channels();
+                    self.rebuild_messages(); // названия веток в сообщениях
+                }
+            }
+            Event::ChannelDelete { guild_id, channel_id } => {
+                if Some(guild_id) == self.guild {
+                    self.channels.retain(|c| c.id != channel_id);
+                    self.unread.remove(&channel_id);
+                    if self.voice.as_ref().is_some_and(|v| v.channel == channel_id) {
+                        self.leave_voice();
+                    }
+                    if self.channel == Some(channel_id) {
+                        self.channel = None;
+                        self.messages.clear();
+                        self.model.set_vec(Vec::new());
+                        match self.channels.iter().find(|c| c.kind == Kind::Text).cloned() {
+                            Some(c) => self.select_channel(&c),
+                            None => self.refresh_channels(),
+                        }
+                        self.set_status("Канал удалён");
+                    } else {
+                        self.refresh_channels();
+                    }
+                }
+            }
+            Event::ChannelsInvalidated { guild_id } => {
+                if Some(guild_id) == self.guild {
+                    self.reload_channels();
+                }
+            }
+            Event::GuildUpdate(g) => {
+                if let Some(x) = self.guilds.iter_mut().find(|x| x.id == g.id) {
+                    *x = g;
+                    self.refresh_guilds();
+                    self.refresh_members();
+                    self.rebuild_messages();
+                }
+            }
+            Event::UserUpdate(u) => self.on_user_update(u),
+            Event::ReactionAdd { message_id, user_id, emoji, .. } => {
+                if let Some(m) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    apply_reaction(m, &emoji, user_id == self.me.id, true);
+                    self.refresh_message(message_id);
+                }
+            }
+            Event::ReactionRemove { message_id, user_id, emoji, .. } => {
+                if let Some(m) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    apply_reaction(m, &emoji, user_id == self.me.id, false);
+                    self.refresh_message(message_id);
                 }
             }
         }
@@ -1800,6 +2153,7 @@ impl App {
                         app.apply_mic();
                         app.refresh_voice();
                         app.send_voice_state();
+                        app.cue(Cue::Join);
                     }
                     // Пользователь уже ушёл из канала, пока мы подключались
                     (Ok(session), None) => {
@@ -1857,16 +2211,25 @@ impl App {
         if let Some(s) = &v.session {
             s.set_deafened(v.deafened);
         }
+        let muted = v.muted;
         self.apply_mic();
         self.refresh_voice();
         self.send_voice_state();
+        self.cue(if muted { Cue::Mute } else { Cue::Unmute });
     }
 
     fn toggle_deafen(&mut self) {
         let Some(v) = self.voice.as_mut() else { return };
         v.deafened = !v.deafened;
         if let Some(s) = &v.session {
+            // Звук до выключения: после него пользователь его уже не услышит
+            if v.deafened && self.settings.voice_sounds {
+                s.play_cue(Cue::Mute);
+            }
             s.set_deafened(v.deafened);
+            if !v.deafened && self.settings.voice_sounds {
+                s.play_cue(Cue::Unmute);
+            }
         }
         self.refresh_voice();
         self.send_voice_state();
@@ -1942,6 +2305,8 @@ impl App {
         ui.set_set_echo(self.settings.echo_cancellation);
         ui.set_set_economy(self.settings.economy_mode);
         ui.set_set_notify(self.settings.notifications);
+        ui.set_set_sounds(self.settings.voice_sounds);
+        ui.set_set_updates(self.settings.check_updates);
         self.device_lists = (inputs, outputs);
         ui.set_dialog("settings".into());
     }
@@ -1959,6 +2324,9 @@ impl App {
             economy_mode: ui.get_set_economy(),
             notifications: ui.get_set_notify(),
             ptt_key: self.settings.ptt_key.clone(),
+            voice_sounds: ui.get_set_sounds(),
+            check_updates: ui.get_set_updates(),
+            volumes: self.settings.volumes.clone(),
         };
         settings::save(&self.settings);
         ui.set_dialog(SharedString::new());
@@ -2003,6 +2371,23 @@ impl App {
         if kind == "delete" {
             ui.set_dialog(SharedString::new());
             self.delete_confirmed();
+            return;
+        }
+        if kind == "ban" {
+            ui.set_dialog(SharedString::new());
+            self.ban_confirmed();
+            return;
+        }
+        if kind == "thread" {
+            if value.is_empty() {
+                return;
+            }
+            ui.set_dialog(SharedString::new());
+            self.create_thread(value);
+            return;
+        }
+        if kind == "confirm-user" {
+            self.admin_delete_confirmed();
             return;
         }
         if kind == "kick" {
@@ -2074,6 +2459,9 @@ impl App {
             ui.set_guild_name(SharedString::new());
             ui.set_channel_name(SharedString::new());
             ui.set_login_name(self.me.username.as_str().into());
+            ui.set_is_admin(false);
+            ui.set_emoji_for(-2);
+            ui.set_update_version(SharedString::new());
         }
         // Состояние удаляем после выхода из текущего заимствования APP
         let _ = slint::invoke_from_event_loop(|| APP.with_borrow_mut(|a| *a = None));

@@ -22,6 +22,11 @@ livekit = { version = "0.9", features = ["rustls-tls-native-roots"] }
 cpal = "0.18"
 nnnoiseless = "0.5"
 ringbuf = "0.4"
+# Буфер обмена: вставка скриншота Ctrl+V, копирование
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Токен входа — в системном хранилище ключей (Secret Service / Windows Credential Manager)
+keyring = { version = "3", features = ["windows-native", "sync-secret-service", "crypto-rust"] }
 
 # Глобальный push-to-talk на Linux/Wayland через XDG-портал (D15)
 [target.'cfg(target_os = "linux")'.dependencies]

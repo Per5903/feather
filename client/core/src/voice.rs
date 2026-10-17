@@ -135,11 +135,13 @@ pub struct VoiceOptions {
     /// В паузах кодировщик простаивает (экономия CPU и трафика), клавиатуру между фразами не слышно.
     /// Для push-to-talk не нужна: там решает клавиша.
     pub voice_activation: bool,
+    /// Громкость собеседников по identity (id пользователя), 1.0 — как есть
+    pub volumes: std::collections::HashMap<String, f32>,
 }
 
 impl Default for VoiceOptions {
     fn default() -> Self {
-        Self { noise_suppression: true, echo_cancellation: true, input_device: None, output_device: None, voice_activation: true }
+        Self { noise_suppression: true, echo_cancellation: true, input_device: None, output_device: None, voice_activation: true, volumes: Default::default() }
     }
 }
 
@@ -160,7 +162,46 @@ fn find_device(devices: Option<impl Iterator<Item = cpal::Device>>, want: &str) 
     devices?.find(|d| d.description().is_ok_and(|x| x.name().to_lowercase().contains(&want)))
 }
 
-type Mixer = Mutex<Vec<(String, HeapCons<f32>)>>;
+/// Собеседник в микшере: identity, его звук, громкость (1.0 — как есть)
+struct Peer {
+    id: String,
+    cons: HeapCons<f32>,
+    gain: f32,
+}
+
+type Mixer = Mutex<Vec<Peer>>;
+
+/// Короткие звуки интерфейса голоса (синтезируются, файлов нет)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cue {
+    /// Кто-то зашёл в канал (и я сам)
+    Join,
+    /// Кто-то вышел
+    Leave,
+    Mute,
+    Unmute,
+}
+
+/// Два тона подряд: вверх — вход/включение, вниз — выход/выключение
+fn cue_samples(cue: Cue) -> Vec<f32> {
+    let (a, b, len_ms, vol) = match cue {
+        Cue::Join => (660.0, 880.0, 90.0, 0.16),
+        Cue::Leave => (880.0, 587.0, 90.0, 0.16),
+        Cue::Unmute => (700.0, 940.0, 55.0, 0.10),
+        Cue::Mute => (940.0, 700.0, 55.0, 0.10),
+    };
+    let n = (SAMPLE_RATE as f32 * len_ms / 1000.0) as usize;
+    let mut out = Vec::with_capacity(n * 2);
+    for freq in [a, b] {
+        for k in 0..n {
+            let t = k as f32 / SAMPLE_RATE as f32;
+            // Плавные края: без щелчков
+            let env = (k as f32 / (n as f32 * 0.15)).min(1.0) * ((n - k) as f32 / (n as f32 * 0.35)).min(1.0);
+            out.push(vol * env * (2.0 * std::f32::consts::PI * freq * t).sin());
+        }
+    }
+    out
+}
 
 struct Shared {
     muted: AtomicBool,
@@ -168,6 +209,10 @@ struct Shared {
     stop: AtomicBool,
     /// Кольца собеседников: identity → поток сэмплов
     mixer: Mixer,
+    /// Громкость собеседников по identity: применяется и к тем, кто зайдёт позже
+    volumes: Mutex<std::collections::HashMap<String, f32>>,
+    /// Звуки интерфейса, ожидающие воспроизведения
+    cues: Mutex<std::collections::VecDeque<f32>>,
 }
 
 pub struct VoiceSession {
@@ -194,6 +239,8 @@ impl VoiceSession {
             deafened: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             mixer: Mutex::new(Vec::new()),
+            volumes: Mutex::new(opts.volumes.clone()),
+            cues: Mutex::new(std::collections::VecDeque::new()),
         });
 
         // Микрофон: источник с выключенной встроенной обработкой — обрабатываем сами
@@ -261,7 +308,7 @@ impl VoiceSession {
                         }
                         RoomEvent::ParticipantDisconnected(p) => {
                             let id = p.identity().to_string();
-                            shared.mixer.lock().unwrap().retain(|(who, _)| *who != id);
+                            shared.mixer.lock().unwrap().retain(|p| p.id != id);
                             on_event(VoiceEvent::PeerLeft(id));
                         }
                         RoomEvent::ActiveSpeakersChanged { speakers } => {
@@ -278,6 +325,23 @@ impl VoiceSession {
         }
 
         Ok(Self { room, shared, audio_thread: Some(audio_thread) })
+    }
+
+    /// Громкость собеседника: 0.0 — тишина, 1.0 — как есть, до 2.0 — громче
+    pub fn set_volume(&self, identity: &str, gain: f32) {
+        let gain = gain.clamp(0.0, 2.0);
+        self.shared.volumes.lock().unwrap().insert(identity.to_owned(), gain);
+        if let Some(p) = self.shared.mixer.lock().unwrap().iter_mut().find(|p| p.id == identity) {
+            p.gain = gain;
+        }
+    }
+
+    /// Проиграть звук интерфейса (вход, выход, микрофон)
+    pub fn play_cue(&self, cue: Cue) {
+        let mut q = self.shared.cues.lock().unwrap();
+        if q.len() < SAMPLE_RATE as usize {
+            q.extend(cue_samples(cue));
+        }
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -382,24 +446,35 @@ fn audio_devices(
                     mono.resize(n, 0.0);
                     // try_lock: аудиопоток никогда не ждёт; в редкий момент смены участников — тишина
                     if let Ok(mut mixer) = shared.mixer.try_lock() {
-                        for (_, cons) in mixer.iter_mut() {
-                            let queued = cons.occupied_len();
+                        for p in mixer.iter_mut() {
+                            let queued = p.cons.occupied_len();
                             if queued > n + MAX_QUEUED {
-                                cons.skip(queued - n - TRIM_TO);
+                                p.cons.skip(queued - n - TRIM_TO);
                             }
                             tmp.clear();
                             tmp.resize(n, 0.0);
-                            let got = cons.pop_slice(&mut tmp);
+                            let got = p.cons.pop_slice(&mut tmp);
                             for (m, s) in mono.iter_mut().zip(&tmp[..got]) {
-                                *m += s;
+                                *m += s * p.gain;
                             }
                         }
                     }
                     if shared.deafened.load(Ordering::Relaxed) {
                         mono.iter_mut().for_each(|s| *s = 0.0);
                     }
+                    // Опорный сигнал для эхоподавления — без звуков интерфейса (их и так не слышно в микрофоне)
                     if let Ok(mut rev) = rev.try_lock() {
                         let _ = rev.push_slice(mono);
+                    }
+                    if let Ok(mut cues) = shared.cues.try_lock()
+                        && !cues.is_empty()
+                    {
+                        for m in mono.iter_mut() {
+                            match cues.pop_front() {
+                                Some(c) => *m += c,
+                                None => break,
+                            }
+                        }
                     }
                 };
                 dev.build_output_stream::<f32, _, _>(
@@ -472,8 +547,15 @@ async fn process_capture(
             let n = rev.pop_slice(&mut reverse);
             reverse[n..].fill(0.0);
 
-            // Микрофон выключен (или PTT отпущен): кадр выбрасываем, кодировщик простаивает
+            // Микрофон выключен (или PTT отпущен): вместо звука — тишина, без обработки.
+            // Кадры нельзя просто пропускать: WebRTC считает время RTP по числу отправленных
+            // сэмплов, и после паузы приёмник решает, что пакеты опаздывают, раздувает буфер —
+            // у собеседника растёт задержка и звук рвётся. Тишину Opus с DTX почти не передаёт
             if shared.muted.load(Ordering::Relaxed) || shared.deafened.load(Ordering::Relaxed) {
+                gate_open_frames = 0;
+                if !send_silence(&source, &mut pcm).await {
+                    return;
+                }
                 continue;
             }
             for (o, s) in pcm.iter_mut().zip(&frame) {
@@ -506,7 +588,11 @@ async fn process_capture(
                 if speech {
                     gate_open_frames = GATE_HANGOVER_FRAMES;
                 } else if gate_open_frames == 0 {
-                    continue; // тишина: кадр не кодируем и не отправляем
+                    // Тишина: отправляем нули (см. выше, почему не пропускаем кадр)
+                    if !send_silence(&source, &mut pcm).await {
+                        return;
+                    }
+                    continue;
                 } else {
                     gate_open_frames -= 1;
                 }
@@ -519,13 +605,21 @@ async fn process_capture(
     }
 }
 
+/// Кадр тишины в источник: время RTP идёт ровно, Opus с DTX передаёт только редкие служебные пакеты
+async fn send_silence(source: &NativeAudioSource, pcm: &mut [i16; FRAME]) -> bool {
+    pcm.fill(0);
+    let af = AudioFrame { data: pcm.as_slice().into(), sample_rate: SAMPLE_RATE, num_channels: 1, samples_per_channel: FRAME as u32 };
+    source.capture_frame(&af).await.is_ok()
+}
+
 /// Звук собеседника: декодированные кадры LiveKit → его кольцо в микшере
 fn play_remote(shared: Arc<Shared>, identity: String, track: RemoteAudioTrack) {
     let (mut prod, cons) = HeapRb::<f32>::new(RING).split();
     {
+        let gain = shared.volumes.lock().unwrap().get(&identity).copied().unwrap_or(1.0);
         let mut mixer = shared.mixer.lock().unwrap();
-        mixer.retain(|(who, _)| *who != identity);
-        mixer.push((identity, cons));
+        mixer.retain(|p| p.id != identity);
+        mixer.push(Peer { id: identity, cons, gain });
     }
     tokio::spawn(async move {
         let mut stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, 1);
@@ -582,7 +676,8 @@ fn collect_stats(stats: &livekit::rtc_engine::SessionStats, prev: &mut (u64, i64
         break;
     }
     let (mut received, mut lost) = (0u64, 0i64);
-    for s in &stats.subscriber_stats {
+    // Одно соединение на всё (новые LiveKit) — входящий звук может быть и в «publisher»
+    for s in stats.subscriber_stats.iter().chain(&stats.publisher_stats) {
         if let RtcStats::InboundRtp(r) = s {
             if r.stream.kind == "audio" {
                 received += r.received.packets_received;
