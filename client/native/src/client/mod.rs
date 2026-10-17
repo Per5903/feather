@@ -1076,8 +1076,10 @@ impl App {
         });
         let in_guild_text = !self.dm_mode && self.channel.and_then(|id| self.channels.iter().find(|c| c.id == id)).is_some_and(|c| c.kind == Kind::Text);
         let embed = m.embeds.first();
+        // Ответ на моё сообщение — тоже обращение ко мне
+        let reply_to_me = m.reply_to_id.is_some_and(|r| self.messages.iter().any(|x| x.id == r && x.author.id == self.me.id));
         Msg {
-            mention: m.author.id != self.me.id && mentions(&m.content, &self.me.username),
+            mention: m.author.id != self.me.id && (mentions(&m.content, &self.me.username) || reply_to_me),
             tint: self.user_tint(m.author.id),
             avatar,
             has_avatar,
