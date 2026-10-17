@@ -106,7 +106,13 @@ async fn session(
                     }
                     Ok(ServerOp::HeartbeatAck) => {}
                     Ok(ServerOp::InvalidSession { reason }) => return End::Invalid(reason),
-                    Err(e) => return lost(&format!("непонятное сообщение шлюза: {e}"), ready),
+                    // Незнакомое событие (сервер новее клиента) — пропускаем, а не рвём соединение:
+                    // иначе после каждого обновления сервера старые клиенты переподключались бы по кругу
+                    Err(e) => {
+                        if std::env::var_os("FEATHER_LOG").is_some() {
+                            eprintln!("шлюз: пропущено непонятное сообщение: {e}");
+                        }
+                    }
                 }
             }
             op = rx.recv() => match op {
@@ -122,5 +128,71 @@ async fn session(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feather_protocol::Snowflake;
+
+    /// Событие, которого этот клиент не знает (как будто сервер новее)
+    #[derive(serde::Serialize)]
+    struct FutureDispatch {
+        op: &'static str,
+        d: FutureEvent,
+    }
+    #[derive(serde::Serialize)]
+    struct FutureEvent {
+        seq: u64,
+        event: FutureBody,
+    }
+    #[derive(serde::Serialize)]
+    struct FutureBody {
+        t: &'static str,
+        data: u32,
+    }
+
+    #[tokio::test]
+    async fn unknown_events_do_not_drop_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Поддельный сервер: HELLO, READY, незнакомое событие, затем обычное
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let send = |op: &ServerOp| Ws::Binary(rmp_serde::to_vec_named(op).unwrap().into());
+            ws.send(send(&ServerOp::Hello { heartbeat_interval_ms: 30_000 })).await.unwrap();
+            let _identify = ws.next().await;
+            let me = User { id: Snowflake(1), username: "me".into(), display_name: None, avatar: None };
+            ws.send(send(&ServerOp::Ready { session_id: "s".into(), user: me, guilds: vec![], unread: vec![], voice_states: vec![], admin: false }))
+                .await
+                .unwrap();
+            let future = FutureDispatch { op: "DISPATCH", d: FutureEvent { seq: 1, event: FutureBody { t: "SOMETHING_NEW", data: 7 } } };
+            ws.send(Ws::Binary(rmp_serde::to_vec_named(&future).unwrap().into())).await.unwrap();
+            let known = ServerOp::Dispatch { seq: 2, event: Event::ChannelAck { channel_id: Snowflake(5), message_id: Snowflake(6) } };
+            ws.send(send(&known)).await.unwrap();
+            // Держим соединение, пока клиент читает
+            let _ = ws.next().await;
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _handle = spawn(format!("ws://{addr}"), "token".into(), move |ev| {
+            let _ = tx.send(ev);
+        });
+        let mut got_ack = false;
+        for _ in 0..3 {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.expect("шлюз молчит").expect("закрыт") {
+                GatewayEvent::Ready { .. } => {}
+                GatewayEvent::Event(Event::ChannelAck { channel_id, .. }) => {
+                    assert_eq!(channel_id, Snowflake(5));
+                    got_ack = true;
+                    break;
+                }
+                GatewayEvent::Reconnecting(why) => panic!("соединение разорвано из-за незнакомого события: {why}"),
+                other => panic!("неожиданно: {other:?}"),
+            }
+        }
+        assert!(got_ack, "известное событие после незнакомого не дошло");
     }
 }
