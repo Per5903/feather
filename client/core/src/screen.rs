@@ -83,19 +83,19 @@ impl Drop for Capture {
 }
 
 /// Запустить захват. `on_end` — захват прекратился сам (отказ в диалоге, окно закрыто)
-pub fn start(source: Option<Source>, quality: Quality, video: NativeVideoSource, on_end: impl FnOnce(String) + Send + 'static) -> Capture {
+pub fn start(source: Option<Source>, quality: Quality, video: NativeVideoSource, sink: Arc<ViewSink>, on_end: impl FnOnce(String) + Send + 'static) -> Capture {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("feather-screen".into())
-            .spawn(move || capture_loop(source, quality, video, stop, on_end))
+            .spawn(move || capture_loop(source, quality, video, sink, stop, on_end))
             .expect("поток захвата экрана")
     };
     Capture { stop, thread: Some(thread) }
 }
 
-fn capture_loop(source: Option<Source>, quality: Quality, video: NativeVideoSource, stop: Arc<AtomicBool>, on_end: impl FnOnce(String)) {
+fn capture_loop(source: Option<Source>, quality: Quality, video: NativeVideoSource, sink: Arc<ViewSink>, stop: Arc<AtomicBool>, on_end: impl FnOnce(String)) {
     #[cfg(target_os = "linux")]
     let kind = DesktopCaptureSourceType::Generic; // экран или окно — выбирают в окне системы
     #[cfg(not(target_os = "linux"))]
@@ -123,6 +123,11 @@ fn capture_loop(source: Option<Source>, quality: Quality, video: NativeVideoSour
                 yuv_helper::argb_to_i420(frame.data(), frame.stride(), y, sy, u, su, v, sv, w as i32, h as i32);
                 let (tw, th) = fit(w, h, quality.max_width, quality.max_height);
                 let buffer = if (tw, th) == (w, h) { full } else { full.scale(tw as i32, th as i32) };
+                // Предпросмотр: только если смотрят и прошлый кадр уже показан
+                if sink.local.load(Ordering::Relaxed) && sink.frame.lock().unwrap().is_none() {
+                    let max = *sink.size.lock().unwrap();
+                    *sink.frame.lock().unwrap() = Some(to_rgba(&buffer, max));
+                }
                 let mut vf = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
                 vf.timestamp_us = start_at.elapsed().as_micros() as i64;
                 video.capture_frame(&vf);
@@ -150,7 +155,18 @@ fn capture_loop(source: Option<Source>, quality: Quality, video: NativeVideoSour
     }
 }
 
-/// Кадр чужой трансляции для показа
+/// Куда класть кадры для показа (чужая трансляция или предпросмотр своей)
+#[derive(Default)]
+pub struct ViewSink {
+    /// Последний ещё не показанный кадр
+    pub frame: std::sync::Mutex<Option<ViewFrame>>,
+    /// Размер окна просмотра: больше кадр не делаем
+    pub size: std::sync::Mutex<(u32, u32)>,
+    /// Показывать свой экран (предпросмотр прямо с захвата, без сервера)
+    pub local: AtomicBool,
+}
+
+/// Кадр трансляции для показа
 pub struct ViewFrame {
     pub width: u32,
     pub height: u32,

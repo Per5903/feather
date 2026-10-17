@@ -219,9 +219,7 @@ struct Shared {
     cues: Mutex<std::collections::VecDeque<f32>>,
     /// Чью трансляцию смотрю (identity) и последний её кадр, ещё не показанный
     watching: Mutex<Option<String>>,
-    screen_frame: Mutex<Option<crate::screen::ViewFrame>>,
-    /// Размер окна просмотра в пикселях: больше кадр не делаем
-    view_size: Mutex<(u32, u32)>,
+    view: Arc<crate::screen::ViewSink>,
 }
 
 pub struct VoiceSession {
@@ -271,8 +269,7 @@ impl VoiceSession {
             stop: AtomicBool::new(false),
             mixer: Mutex::new(Vec::new()),
             watching: Mutex::new(None),
-            screen_frame: Mutex::new(None),
-            view_size: Mutex::new((1280, 720)),
+            view: Arc::new(crate::screen::ViewSink { size: Mutex::new((1280, 720)), ..Default::default() }),
             volumes: Mutex::new(opts.volumes.clone()),
             cues: Mutex::new(std::collections::VecDeque::new()),
         });
@@ -410,7 +407,7 @@ impl VoiceSession {
         use livekit::options::{VideoCodec, VideoEncoding};
         use livekit::webrtc::video_source::native::NativeVideoSource;
         use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
-        let (room, slot) = (self.room.clone(), self.screen.clone());
+        let (room, slot, sink) = (self.room.clone(), self.screen.clone(), self.shared.view.clone());
         async move {
             stop_screen(&room, &slot).await;
             let video = NativeVideoSource::new(VideoResolution { width: quality.max_width, height: quality.max_height }, true);
@@ -430,7 +427,7 @@ impl VoiceSession {
                 )
                 .await
                 .map_err(|e| format!("не удалось начать показ: {e}"))?;
-            let capture = crate::screen::start(source, quality, video, on_end);
+            let capture = crate::screen::start(source, quality, video, sink, on_end);
             *slot.lock().unwrap() = Some((capture, publication.sid()));
             Ok(())
         }
@@ -454,17 +451,24 @@ impl VoiceSession {
             }
         }
         *watching = identity.map(str::to_owned);
-        *self.shared.screen_frame.lock().unwrap() = None;
+        self.shared.view.local.store(false, Ordering::Relaxed);
+        *self.shared.view.frame.lock().unwrap() = None;
+    }
+
+    /// Смотреть свой показ (предпросмотр с захвата, через сервер не идёт)
+    pub fn watch_self(&self) {
+        self.watch(None);
+        self.shared.view.local.store(true, Ordering::Relaxed);
     }
 
     /// Размер области просмотра (физические пиксели)
     pub fn set_view_size(&self, w: u32, h: u32) {
-        *self.shared.view_size.lock().unwrap() = (w, h);
+        *self.shared.view.size.lock().unwrap() = (w, h);
     }
 
     /// Последний ещё не показанный кадр трансляции
     pub fn take_screen_frame(&self) -> Option<crate::screen::ViewFrame> {
-        self.shared.screen_frame.lock().unwrap().take()
+        self.shared.view.frame.lock().unwrap().take()
     }
 
     /// Громкость собеседника: 0.0 — тишина, 1.0 — как есть, до 2.0 — громче
@@ -762,12 +766,12 @@ fn view_remote(shared: Arc<Shared>, identity: String, track: RemoteVideoTrack) {
             if shared.stop.load(Ordering::Relaxed) || shared.watching.lock().unwrap().as_deref() != Some(identity.as_str()) {
                 break;
             }
-            if shared.screen_frame.lock().unwrap().is_some() {
+            if shared.view.frame.lock().unwrap().is_some() {
                 continue;
             }
-            let max = *shared.view_size.lock().unwrap();
+            let max = *shared.view.size.lock().unwrap();
             let view = crate::screen::to_rgba(frame.buffer.as_ref(), max);
-            *shared.screen_frame.lock().unwrap() = Some(view);
+            *shared.view.frame.lock().unwrap() = Some(view);
         }
     });
 }

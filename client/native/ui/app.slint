@@ -533,9 +533,10 @@ component ChannelRow inherits VerticalLayout {
                 lta := TouchArea {
                     width: 52px;
                     height: 18px;
-                    mouse-cursor: m.me ? default : pointer;
-                    clicked => { if (!m.me) { root.watch(m.id); } }
-                    Rectangle { border-radius: 4px; background: lta.has-hover && !m.me ? #ff5a5f : #ed4245; }
+                    mouse-cursor: pointer;
+                    // Свой значок — предпросмотр своего показа
+                    clicked => { root.watch(m.id); }
+                    Rectangle { border-radius: 4px; background: lta.has-hover ? #ff5a5f : #ed4245; }
                     Text { text: "В ЭФИРЕ"; color: #fff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
             }

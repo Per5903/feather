@@ -18,6 +18,9 @@ impl App {
         if session.is_sharing() {
             self.rt.spawn(session.stop_screen());
             self.sharing = false;
+            if self.watching == Some(self.me.id) {
+                self.close_screen();
+            }
             self.refresh_voice();
             return;
         }
@@ -51,6 +54,9 @@ impl App {
                         app.rt.spawn(s.stop_screen());
                     }
                     app.sharing = false;
+                    if app.watching == Some(app.me.id) {
+                        app.close_screen();
+                    }
                     app.refresh_voice();
                     app.set_status(reason);
                 }
@@ -91,15 +97,25 @@ impl App {
 
     pub(super) fn watch_screen(&mut self, id: String) {
         let Ok(uid) = id.parse::<u64>().map(Snowflake) else { return };
-        if uid == self.me.id || !self.screen_live.contains(&uid) {
+        let me = uid == self.me.id;
+        if (me && !self.sharing) || (!me && !self.screen_live.contains(&uid)) {
             return;
         }
         let Some(session) = self.session() else { return };
         // Подписка LiveKit запускает задачи tokio — нужен контекст рантайма
         let _rt = self.rt.enter();
-        session.watch(Some(&id));
+        if me {
+            // Свой экран: предпросмотр прямо с захвата
+            session.watch_self();
+        } else {
+            session.watch(Some(&id));
+        }
         self.watching = Some(uid);
-        let name = self.voice_states.get(&uid).map(|v| v.user.shown_name().to_owned()).unwrap_or_else(|| "участник".into());
+        let name = if me {
+            "Ваш экран — так его видят другие".to_owned()
+        } else {
+            self.voice_states.get(&uid).map(|v| v.user.shown_name().to_owned()).unwrap_or_else(|| "участник".into())
+        };
         if let Some(ui) = self.ui() {
             ui.set_screen_name(name.into());
             ui.set_screen_has_frame(false);
