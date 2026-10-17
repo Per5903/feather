@@ -26,6 +26,7 @@ use crate::{AppWindow, ChannelItem, ChannelKind, GuildItem, ListRow, Member, Men
 mod account;
 mod extras;
 mod manage;
+mod screen;
 pub mod render;
 
 /// Страница релизов: куда ведёт «Вышла новая версия»
@@ -283,6 +284,11 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_list_open(|i| post(move |app| app.list_open(i as usize)));
     ui.on_list_action(|i| post(move |app| app.list_action(i as usize)));
     ui.on_voice_member(|id| post(move |app| app.open_volume(id.to_string())));
+    ui.on_toggle_screen(|| post(|app| app.toggle_screen()));
+    ui.on_start_screen(|| post(|app| app.start_screen()));
+    ui.on_watch_screen(|id| post(move |app| app.watch_screen(id.to_string())));
+    ui.on_close_screen(|| post(|app| app.close_screen()));
+    ui.on_toggle_fullscreen(|| post(|app| app.toggle_fullscreen()));
     ui.on_volume_changed(|v| post(move |app| app.volume_changed(v)));
     ui.on_open_update(|| post(|app| app.open_update()));
     ui.on_channel_settings(|i| post(move |app| app.open_channel_settings(i as usize)));
@@ -589,6 +595,12 @@ struct App {
     mention_candidates: Vec<User>,
     /// Страница новой версии
     update_url: Option<String>,
+    /// Показ экрана: кто сейчас в эфире, кого смотрю, опрос кадров, мои источники, я показываю
+    screen_live: HashSet<Snowflake>,
+    watching: Option<Snowflake>,
+    screen_timer: Timer,
+    screen_sources: Vec<feather_core::screen::Source>,
+    sharing: bool,
 }
 
 impl App {
@@ -673,6 +685,11 @@ impl App {
             pending_user_delete: None,
             mention_candidates: Vec::new(),
             update_url: None,
+            screen_live: HashSet::new(),
+            watching: None,
+            screen_timer: Timer::default(),
+            screen_sources: Vec::new(),
+            sharing: false,
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
         APP.with_borrow_mut(|slot| {
@@ -826,6 +843,7 @@ impl App {
                     muted: v.muted || v.deafened,
                     me: v.user.id == self.me.id,
                     volume_changed: self.settings.volumes.get(&v.user.id.to_string()).is_some_and(|g| (*g - 1.0).abs() > 0.01),
+                    live: if v.user.id == self.me.id { self.sharing } else { self.screen_live.contains(&v.user.id) },
                 }
             })
             .collect();
@@ -850,6 +868,7 @@ impl App {
                 ui.set_voice_state(if v.session.is_some() { "Голос подключён" } else { "Подключение…" }.into());
                 ui.set_voice_muted(v.muted || v.deafened);
                 ui.set_voice_deafened(v.deafened);
+                ui.set_voice_sharing(self.sharing);
             }
             None => ui.set_voice_channel(SharedString::new()),
         }
@@ -2190,7 +2209,18 @@ impl App {
                 }
                 return;
             }
+            VoiceEvent::Screen { identity, live } => {
+                self.on_screen(identity, live);
+                return;
+            }
+            VoiceEvent::ScreenEnded(reason) => {
+                self.set_status(reason);
+                return;
+            }
             VoiceEvent::Disconnected(reason) => {
+                self.close_screen();
+                self.screen_live.clear();
+                self.sharing = false;
                 self.voice = None;
                 self.send_voice_state();
                 self.set_status(format!("Голос отключён ({reason})"));
@@ -2327,6 +2357,7 @@ impl App {
             voice_sounds: ui.get_set_sounds(),
             check_updates: ui.get_set_updates(),
             volumes: self.settings.volumes.clone(),
+            screen_quality: self.settings.screen_quality,
         };
         settings::save(&self.settings);
         ui.set_dialog(SharedString::new());
@@ -2338,6 +2369,9 @@ impl App {
     }
 
     fn leave_voice(&mut self) {
+        self.close_screen();
+        self.screen_live.clear();
+        self.sharing = false;
         let was = self.voice.take();
         if let Some(session) = was.and_then(|v| v.session) {
             self.rt.spawn(session.leave());

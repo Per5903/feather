@@ -59,7 +59,8 @@ export component Avatar inherits Rectangle {
     height: size;
     border-radius: size / 2;
     background: has-image ? transparent : tint;
-    clip: true;
+    // Обрезка дорогая (слой на каждый элемент) — только когда есть картинка
+    clip: has-image;
     if !has-image: Text {
         width: parent.width;
         height: parent.height;

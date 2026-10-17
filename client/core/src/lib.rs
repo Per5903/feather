@@ -7,6 +7,7 @@ pub mod files;
 pub mod gateway;
 pub mod hotkey;
 pub mod notify;
+pub mod screen;
 pub mod secrets;
 pub mod update;
 pub mod voice;

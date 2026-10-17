@@ -25,6 +25,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// Громкость собеседников: id пользователя → множитель (1.0 — как есть)
     pub volumes: std::collections::HashMap<String, f32>,
+    /// Качество показа экрана: номер в feather_core::screen::QUALITIES
+    pub screen_quality: usize,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Default for Settings {
             voice_sounds: true,
             check_updates: true,
             volumes: Default::default(),
+            screen_quality: 1,
         }
     }
 }

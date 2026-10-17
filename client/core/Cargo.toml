@@ -18,7 +18,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # Голос (docs/06-voice.md, D17): свой аудиотракт вокруг LiveKit
-livekit = { version = "0.9", features = ["rustls-tls-native-roots"] }
+livekit = { version = "0.9", features = ["rustls-tls-native-roots", "glib-main-loop"] }
 cpal = "0.18"
 nnnoiseless = "0.5"
 ringbuf = "0.4"

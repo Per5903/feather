@@ -107,6 +107,10 @@ pub enum VoiceEvent {
     Warning(String),
     /// Качество связи с голосовым сервером, раз в 2 секунды
     Stats(VoiceStats),
+    /// Участник начал (true) или закончил (false) показ экрана
+    Screen { identity: String, live: bool },
+    /// Мой показ экрана прекратился сам (отменён в окне системы, окно закрыто)
+    ScreenEnded(String),
     Disconnected(String),
 }
 
@@ -213,12 +217,36 @@ struct Shared {
     volumes: Mutex<std::collections::HashMap<String, f32>>,
     /// Звуки интерфейса, ожидающие воспроизведения
     cues: Mutex<std::collections::VecDeque<f32>>,
+    /// Чью трансляцию смотрю (identity) и последний её кадр, ещё не показанный
+    watching: Mutex<Option<String>>,
+    screen_frame: Mutex<Option<crate::screen::ViewFrame>>,
+    /// Размер окна просмотра в пикселях: больше кадр не делаем
+    view_size: Mutex<(u32, u32)>,
 }
 
 pub struct VoiceSession {
     room: Arc<Room>,
     shared: Arc<Shared>,
     audio_thread: Option<std::thread::JoinHandle<()>>,
+    /// Мой показ экрана: захват и опубликованная дорожка
+    screen: Arc<Mutex<Option<(crate::screen::Capture, TrackSid)>>>,
+}
+
+type ScreenSlot = Arc<Mutex<Option<(crate::screen::Capture, TrackSid)>>>;
+
+/// Остановить свой показ: захват — сразу (поток), дорожку — снять с публикации
+async fn stop_screen(room: &Room, slot: &ScreenSlot) {
+    let taken = slot.lock().unwrap().take();
+    if let Some((capture, sid)) = taken {
+        // Остановка ждёт поток захвата — не в рантайме
+        let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+        let _ = room.local_participant().unpublish_track(&sid).await;
+    }
+}
+
+/// Трансляция экрана участника — среди его публикаций
+fn screen_publication(p: &RemoteParticipant) -> Option<RemoteTrackPublication> {
+    p.track_publications().into_values().find(|t| t.source() == TrackSource::Screenshare)
 }
 
 impl VoiceSession {
@@ -230,7 +258,10 @@ impl VoiceSession {
         on_event: impl Fn(VoiceEvent) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let on_event = Arc::new(on_event);
-        let (room, mut events) = Room::connect(url, token, RoomOptions::default())
+        // Подписываемся сами: звук — всегда, чужой экран — только когда его смотрят (трафик и CPU)
+        let mut room_opts = RoomOptions::default();
+        room_opts.auto_subscribe = false;
+        let (room, mut events) = Room::connect(url, token, room_opts)
             .await
             .map_err(|e| format!("не удалось подключиться к голосовому серверу: {e}"))?;
         let room = Arc::new(room);
@@ -239,6 +270,9 @@ impl VoiceSession {
             deafened: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             mixer: Mutex::new(Vec::new()),
+            watching: Mutex::new(None),
+            screen_frame: Mutex::new(None),
+            view_size: Mutex::new((1280, 720)),
             volumes: Mutex::new(opts.volumes.clone()),
             cues: Mutex::new(std::collections::VecDeque::new()),
         });
@@ -279,6 +313,21 @@ impl VoiceSession {
             .map(|p| VoicePeer::new(p.identity().to_string(), p.name().to_string()))
             .collect();
         on_event(VoiceEvent::Joined { me, peers });
+        // Кто уже в комнате: звук слушаем, о трансляциях сообщаем
+        for p in room.remote_participants().values() {
+            for publication in p.track_publications().values() {
+                if std::env::var_os("FEATHER_LOG").is_some() {
+                    eprintln!("голос: у {} дорожка {:?} {:?}", p.identity(), publication.kind(), publication.source());
+                }
+                match publication.kind() {
+                    TrackKind::Audio => publication.set_subscribed(true),
+                    TrackKind::Video if publication.source() == TrackSource::Screenshare => {
+                        on_event(VoiceEvent::Screen { identity: p.identity().to_string(), live: true })
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Пинг и потери
         {
@@ -303,12 +352,35 @@ impl VoiceSession {
                         RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(t), participant, .. } => {
                             play_remote(shared.clone(), participant.identity().to_string(), t);
                         }
+                        RoomEvent::TrackSubscribed { track: RemoteTrack::Video(t), participant, .. } => {
+                            view_remote(shared.clone(), participant.identity().to_string(), t);
+                        }
+                        RoomEvent::TrackPublished { publication, participant } => match publication.kind() {
+                            _ if std::env::var_os("FEATHER_LOG").is_some() && {
+                                eprintln!("голос: опубликована {:?} {:?} у {}", publication.kind(), publication.source(), participant.identity());
+                                false
+                            } => {}
+                            TrackKind::Audio => publication.set_subscribed(true),
+                            TrackKind::Video if publication.source() == TrackSource::Screenshare => {
+                                let id = participant.identity().to_string();
+                                // Уже смотрели этого человека (переподключился) — продолжаем
+                                if shared.watching.lock().unwrap().as_deref() == Some(id.as_str()) {
+                                    publication.set_subscribed(true);
+                                }
+                                on_event(VoiceEvent::Screen { identity: id, live: true });
+                            }
+                            _ => {}
+                        },
+                        RoomEvent::TrackUnpublished { publication, participant } if publication.source() == TrackSource::Screenshare => {
+                            on_event(VoiceEvent::Screen { identity: participant.identity().to_string(), live: false });
+                        }
                         RoomEvent::ParticipantConnected(p) => {
                             on_event(VoiceEvent::PeerJoined(VoicePeer::new(p.identity().to_string(), p.name().to_string())))
                         }
                         RoomEvent::ParticipantDisconnected(p) => {
                             let id = p.identity().to_string();
                             shared.mixer.lock().unwrap().retain(|p| p.id != id);
+                            on_event(VoiceEvent::Screen { identity: id.clone(), live: false });
                             on_event(VoiceEvent::PeerLeft(id));
                         }
                         RoomEvent::ActiveSpeakersChanged { speakers } => {
@@ -324,7 +396,75 @@ impl VoiceSession {
             });
         }
 
-        Ok(Self { room, shared, audio_thread: Some(audio_thread) })
+        Ok(Self { room, shared, audio_thread: Some(audio_thread), screen: Arc::new(Mutex::new(None)) })
+    }
+
+    /// Начать показ экрана. На Linux система сама спросит, что показывать.
+    /// Возвращает задачу без ссылок на сессию: её можно запустить в фоне
+    pub fn start_screen(
+        &self,
+        source: Option<crate::screen::Source>,
+        quality: crate::screen::Quality,
+        on_end: impl FnOnce(String) + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'static {
+        use livekit::options::{VideoCodec, VideoEncoding};
+        use livekit::webrtc::video_source::native::NativeVideoSource;
+        use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
+        let (room, slot) = (self.room.clone(), self.screen.clone());
+        async move {
+            stop_screen(&room, &slot).await;
+            let video = NativeVideoSource::new(VideoResolution { width: quality.max_width, height: quality.max_height }, true);
+            let track = LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(video.clone()));
+            let publication = room
+                .local_participant()
+                .publish_track(
+                    LocalTrack::Video(track),
+                    TrackPublishOptions {
+                        source: TrackSource::Screenshare,
+                        // H.264: WebRTC берёт аппаратный кодировщик, если он есть (D14)
+                        video_codec: VideoCodec::H264,
+                        simulcast: false,
+                        video_encoding: Some(VideoEncoding { max_bitrate: quality.bitrate, max_framerate: quality.fps as f64 }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| format!("не удалось начать показ: {e}"))?;
+            let capture = crate::screen::start(source, quality, video, on_end);
+            *slot.lock().unwrap() = Some((capture, publication.sid()));
+            Ok(())
+        }
+    }
+
+    pub fn stop_screen(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (room, slot) = (self.room.clone(), self.screen.clone());
+        async move { stop_screen(&room, &slot).await }
+    }
+
+    pub fn is_sharing(&self) -> bool {
+        self.screen.lock().unwrap().is_some()
+    }
+
+    /// Смотреть трансляцию участника (None — перестать). Подписка только на одну
+    pub fn watch(&self, identity: Option<&str>) {
+        let mut watching = self.shared.watching.lock().unwrap();
+        for p in self.room.remote_participants().values() {
+            if let Some(publication) = screen_publication(p) {
+                publication.set_subscribed(Some(p.identity().as_str()) == identity);
+            }
+        }
+        *watching = identity.map(str::to_owned);
+        *self.shared.screen_frame.lock().unwrap() = None;
+    }
+
+    /// Размер области просмотра (физические пиксели)
+    pub fn set_view_size(&self, w: u32, h: u32) {
+        *self.shared.view_size.lock().unwrap() = (w, h);
+    }
+
+    /// Последний ещё не показанный кадр трансляции
+    pub fn take_screen_frame(&self) -> Option<crate::screen::ViewFrame> {
+        self.shared.screen_frame.lock().unwrap().take()
     }
 
     /// Громкость собеседника: 0.0 — тишина, 1.0 — как есть, до 2.0 — громче
@@ -354,6 +494,7 @@ impl VoiceSession {
     }
 
     pub async fn leave(mut self) {
+        stop_screen(&self.room, &self.screen).await;
         self.shared.stop.store(true, Ordering::Relaxed);
         let _ = self.room.close().await;
         if let Some(t) = self.audio_thread.take() {
@@ -610,6 +751,25 @@ async fn send_silence(source: &NativeAudioSource, pcm: &mut [i16; FRAME]) -> boo
     pcm.fill(0);
     let af = AudioFrame { data: pcm.as_slice().into(), sample_rate: SAMPLE_RATE, num_channels: 1, samples_per_channel: FRAME as u32 };
     source.capture_frame(&af).await.is_ok()
+}
+
+/// Чужая трансляция: кадры в RGBA, но только когда прошлый уже показан —
+/// лишние кадры не переводим (экономия CPU, если окно не успевает)
+fn view_remote(shared: Arc<Shared>, identity: String, track: RemoteVideoTrack) {
+    tokio::spawn(async move {
+        let mut stream = livekit::webrtc::video_stream::native::NativeVideoStream::new(track.rtc_track());
+        while let Some(frame) = stream.next().await {
+            if shared.stop.load(Ordering::Relaxed) || shared.watching.lock().unwrap().as_deref() != Some(identity.as_str()) {
+                break;
+            }
+            if shared.screen_frame.lock().unwrap().is_some() {
+                continue;
+            }
+            let max = *shared.view_size.lock().unwrap();
+            let view = crate::screen::to_rgba(frame.buffer.as_ref(), max);
+            *shared.screen_frame.lock().unwrap() = Some(view);
+        }
+    });
 }
 
 /// Звук собеседника: декодированные кадры LiveKit → его кольцо в микшере

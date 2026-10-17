@@ -70,6 +70,7 @@ export component AccountDialog inherits Backdrop {
     callback enable-totp();
     callback disable-totp();
     callback delete-account();
+    callback logout();
     callback close();
     Card {
         card-width: 500px;
@@ -97,7 +98,12 @@ export component AccountDialog inherits Backdrop {
                 LineEdit { text <=> root.display-name; placeholder-text: username; accepted => { root.save-profile(); } }
             }
             Hint { text: "Так вас видят в чате и голосе. Пусто — показывается логин. Войти по-прежнему можно только с логином."; }
-            HorizontalLayout { alignment: end; Button { text: "Сохранить"; primary: true; clicked => { root.save-profile(); } } }
+            HorizontalLayout {
+                spacing: 8px;
+                Button { text: "Выйти из аккаунта"; clicked => { root.logout(); } }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Сохранить"; primary: true; clicked => { root.save-profile(); } }
+            }
         }
         if tab == 1: VerticalLayout {
             spacing: 12px;
@@ -441,6 +447,36 @@ export component EmojiPicker inherits Rectangle {
                 Rectangle { border-radius: 6px; background: eta.has-hover ? Theme.hover : transparent; }
                 Text { text: e; font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
             }
+        }
+    }
+}
+
+/// Начать показ экрана: качество и (на Windows) что показывать
+export component ScreenDialog inherits Backdrop {
+    in property <[string]> qualities;
+    in-out property <int> quality;
+    in property <[string]> sources;
+    in-out property <int> source;
+    callback start();
+    callback close();
+    Card {
+        card-width: 440px;
+        Title { text: "Показать экран"; }
+        if sources.length > 0: Field {
+            label: "ЧТО ПОКАЗЫВАТЬ";
+            ComboBox { model: sources; current-index <=> root.source; }
+        }
+        if sources.length == 0: Hint { text: "После нажатия «Начать» система спросит, какой экран или окно показать."; }
+        Field {
+            label: "КАЧЕСТВО";
+            ComboBox { model: qualities; current-index <=> root.quality; }
+        }
+        Hint { text: "60 кадров — для игр, если видеокарта кодирует видео сама (NVIDIA, Intel, AMD). Смотрят только те, кто нажал «В ЭФИРЕ»: остальным трансляция не стоит ни трафика, ни ресурсов."; }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button { text: "Отмена"; clicked => { root.close(); } }
+            Button { text: "Начать"; primary: true; clicked => { root.start(); } }
         }
     }
 }

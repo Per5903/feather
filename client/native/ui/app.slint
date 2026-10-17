@@ -3,7 +3,7 @@
 
 import { ListView, LineEdit, Button, ComboBox, Switch } from "std-widgets.slint";
 import { Theme, Avatar, Icon, IconButton, Field, SettingRow, Backdrop, LinkButton, ListRow, RoleToggle, MentionItem } from "common.slint";
-import { AccountDialog, GuildSettingsDialog, ChannelSettingsDialog, AdminDialog, VolumeDialog, MessageListDialog, EmojiPicker } from "dialogs.slint";
+import { AccountDialog, GuildSettingsDialog, ChannelSettingsDialog, AdminDialog, VolumeDialog, MessageListDialog, EmojiPicker, ScreenDialog } from "dialogs.slint";
 
 export { ListRow, RoleToggle, MentionItem }
 
@@ -95,6 +95,8 @@ export struct VoiceMember {
     me: bool,
     /// Громкость у меня не 100%
     volume-changed: bool,
+    /// Показывает экран
+    live: bool,
 }
 
 export struct ChannelItem {
@@ -411,6 +413,7 @@ component ChannelRow inherits VerticalLayout {
     callback add();
     callback settings();
     callback voice-member(string);
+    callback watch(string);
     Rectangle {
         property <bool> lit: c.active || c.unread || cta.has-hover;
         height: c.kind == ChannelKind.category ? 30px : c.kind == ChannelKind.thread ? 28px : 32px;
@@ -522,6 +525,17 @@ component ChannelRow inherits VerticalLayout {
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
+            }
+            if m.live: VerticalLayout {
+                alignment: center;
+                lta := TouchArea {
+                    width: 52px;
+                    height: 18px;
+                    mouse-cursor: m.me ? default : pointer;
+                    clicked => { if (!m.me) { root.watch(m.id); } }
+                    Rectangle { border-radius: 4px; background: lta.has-hover && !m.me ? #ff5a5f : #ed4245; }
+                    Text { text: "В ЭФИРЕ"; color: #fff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
             }
             if m.volume-changed: VerticalLayout {
                 alignment: center;
@@ -1065,6 +1079,22 @@ export component AppWindow inherits Window {
     in property <bool> voice-deafened;
     callback toggle-mute();
     callback voice-member(string);
+    // ---- демонстрация экрана
+    in property <bool> voice-sharing;
+    callback toggle-screen();
+    in property <[string]> screen-qualities;
+    in-out property <int> screen-quality;
+    in property <[string]> screen-sources;
+    in-out property <int> screen-source;
+    callback start-screen();
+    callback watch-screen(string);
+    /// Смотрю трансляцию: чья ("" — не смотрю), кадр, во весь экран
+    in property <string> screen-name;
+    in property <image> screen-image;
+    in property <bool> screen-has-frame;
+    in property <bool> screen-full;
+    callback close-screen();
+    callback toggle-fullscreen();
     // Громкость участника
     in property <string> volume-name;
     in-out property <float> volume-value;
@@ -1261,8 +1291,8 @@ export component AppWindow inherits Window {
     // на экране входа область чата просто не видна (её закрывает LoginScreen выше по z)
     main := HorizontalLayout {
         visible: logged-in;
-        // ---- Список серверов
-        VerticalLayout {
+        // ---- Список серверов (во весь экран трансляции — скрыт)
+        if !screen-full: VerticalLayout {
             width: 64px;
             padding-top: 12px;
             spacing: 8px;
@@ -1365,7 +1395,7 @@ export component AppWindow inherits Window {
         }
 
         // ---- Каналы
-        Rectangle {
+        if !screen-full: Rectangle {
             width: 232px;
             background: Theme.bg1;
             VerticalLayout {
@@ -1422,6 +1452,7 @@ export component AppWindow inherits Window {
                             add => { root.add-channel(i); }
                             settings => { root.channel-settings(i); }
                             voice-member(id) => { root.voice-member(id); }
+                            watch(id) => { root.watch-screen(id); }
                         }
                     }
                 }
@@ -1462,6 +1493,16 @@ export component AppWindow inherits Window {
                                     font-size: 12px;
                                     overflow: elide;
                                 }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Показать экран: монитор со стрелкой
+                                icon: "M20 3H4c-1.1 0-2 .9-2 2v11c0 1.1.9 2 2 2h3l-1 1v2h12v-2l-1-1h3c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 13H4V5h16v11zM12 6.5 8.5 10H11v4h2v-4h2.5z";
+                                on: voice-sharing;
+                                on-color: Theme.ok;
+                                clicked => { root.toggle-screen(); }
                             }
                         }
                         VerticalLayout {
@@ -1545,23 +1586,74 @@ export component AppWindow inherits Window {
                                 clicked => { root.open-settings(); }
                             }
                         }
-                        VerticalLayout {
-                            alignment: center;
-                            IconButton {
-                                // «Выйти»
-                                icon: "M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z";
-                                clicked => { root.logout(); }
-                            }
-                        }
                     }
                 }
             }
         }
 
-        // ---- Чат
+        // ---- Чат (или трансляция поверх него)
         Rectangle {
             horizontal-stretch: 1;
             background: Theme.bg2;
+            if screen-name != "": Rectangle {
+                z: 10;
+                background: #000;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: screen-image;
+                    image-fit: contain;
+                    visible: screen-has-frame;
+                }
+                if !screen-has-frame: Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "Подключаюсь к трансляции…";
+                    color: Theme.dim;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    double-clicked => { root.toggle-fullscreen(); }
+                }
+                Rectangle {
+                    y: 0;
+                    height: 44px;
+                    background: #000000a0;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        Rectangle {
+                            width: 58px;
+                            height: 20px;
+                            y: 12px;
+                            border-radius: 4px;
+                            background: #ed4245;
+                            Text { text: "В ЭФИРЕ"; color: #fff; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Text { text: screen-name; color: #fff; font-weight: 600; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Во весь экран / обратно
+                                icon: screen-full
+                                    ? "M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"
+                                    : "M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z";
+                                clicked => { root.toggle-fullscreen(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                // Закрыть просмотр
+                                icon: "M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z";
+                                clicked => { root.close-screen(); }
+                            }
+                        }
+                    }
+                }
+            }
             VerticalLayout {
                 if update-version != "": uta := TouchArea {
                     height: 30px;
@@ -1829,7 +1921,7 @@ export component AppWindow inherits Window {
         }
 
         // ---- Участники
-        Rectangle {
+        if !screen-full: Rectangle {
             width: 220px;
             background: Theme.bg1;
             Flickable {
@@ -2066,6 +2158,7 @@ export component AppWindow inherits Window {
         enable-totp => { root.account-enable-totp(); }
         disable-totp => { root.account-disable-totp(); }
         delete-account => { root.account-delete(); }
+        logout => { root.logout(); }
         close => { root.dialog = ""; }
     }
     if dialog == "guild": GuildSettingsDialog {
@@ -2109,6 +2202,14 @@ export component AppWindow inherits Window {
         set-registration(i) => { root.admin-set-registration(i); }
         reset-password(i) => { root.admin-reset-password(i); }
         delete-user(i) => { root.admin-delete-user(i); }
+        close => { root.dialog = ""; }
+    }
+    if dialog == "screen": ScreenDialog {
+        qualities: root.screen-qualities;
+        quality <=> root.screen-quality;
+        sources: root.screen-sources;
+        source <=> root.screen-source;
+        start => { root.start-screen(); }
         close => { root.dialog = ""; }
     }
     if dialog == "volume": VolumeDialog {
